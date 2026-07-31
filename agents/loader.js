@@ -18,6 +18,7 @@ import * as fsMonitor from "./fs_monitor/fs_monitor.js";
 import * as tlsInspector from "./tls_inspector/tls_inspector.js";
 import * as antiDebug from "./anti_debug/anti_debug.js";
 import * as recon from "./recon/recon.js";
+import * as flutterTls from "./flutter_tls/flutter_tls.js";
 
 const MODULE_NAME = "loader";
 
@@ -26,6 +27,7 @@ const MODULE_REGISTRY = {
     tls: tlsInspector,
     antidebug: antiDebug,
     recon,
+    flutter_tls: flutterTls,
 };
 
 /**
