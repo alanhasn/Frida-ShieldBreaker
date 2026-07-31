@@ -19,6 +19,7 @@ import * as tlsInspector from "./tls_inspector/tls_inspector.js";
 import * as antiDebug from "./anti_debug/anti_debug.js";
 import * as recon from "./recon/recon.js";
 import * as flutterTls from "./flutter_tls/flutter_tls.js";
+import { selectModulesForDetectedFrameworks } from "./framework_detection/detector.js";
 
 const MODULE_NAME = "loader";
 
@@ -33,19 +34,30 @@ const MODULE_REGISTRY = {
 /**
  * Payload shape posted by core/loader.py's `load_agent(..., init_payload=...)`:
  *   {
- *     enabled_modules: string[],           // e.g. ["fs", "tls", "antidebug"]
+ *     enabled_modules: string[],   // e.g. ["fs", "tls", "antidebug"] -- omitted when auto_detect is true
  *     module_config: { [name]: object },   // optional per-module options
+ *     default_bypass: boolean,     // applied to every enabled module unless overridden in module_config
+ *     auto_detect: boolean,        // when true, the module list comes from framework_detection instead
  *   }
  */
 function bootstrap(initPayload) {
     const payload = initPayload ?? {};
-    const enabled = payload.enabled_modules ?? Object.keys(MODULE_REGISTRY);
     const moduleConfig = payload.module_config ?? {};
+    const defaultBypass = Boolean(payload.default_bypass);
+
+    // enabled_modules is only meaningful (and only sent) when auto_detect
+    // is false -- see main.py's cmd_run. Detection itself only ever runs
+    // once per process regardless of how bootstrap ends up being invoked,
+    // since detectFrameworks() memoizes its result.
+    const enabled = payload.auto_detect
+        ? selectModulesForDetectedFrameworks()
+        : payload.enabled_modules ?? Object.keys(MODULE_REGISTRY);
 
     log(
         MODULE_NAME,
         "info",
-        `Bootstrapping on ${platformInfo.platform}/${platformInfo.arch}; modules=[${enabled.join(", ")}]`
+        `Bootstrapping on ${platformInfo.platform}/${platformInfo.arch}; modules=[${enabled.join(", ")}]` +
+            (payload.auto_detect ? " (auto-detected)" : "")
     );
 
     const initialized = [];
@@ -55,15 +67,16 @@ function bootstrap(initPayload) {
             log(MODULE_NAME, "warning", `Unknown module requested: '${name}'`);
             continue;
         }
+        const config = { bypass: defaultBypass, ...(moduleConfig[name] ?? {}) };
         try {
-            mod.init(moduleConfig[name] ?? {});
+            mod.init(config);
             initialized.push(name);
         } catch (e) {
             log(MODULE_NAME, "error", `Module '${name}' threw during init(): ${e.stack || e}`);
         }
     }
 
-    rpc.ready(MODULE_NAME, { enabled_modules: initialized });
+    rpc.ready(MODULE_NAME, { enabled_modules: initialized, auto_detect: Boolean(payload.auto_detect) });
 }
 
 rpc.once("init", bootstrap);
