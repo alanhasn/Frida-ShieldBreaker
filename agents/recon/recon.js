@@ -264,6 +264,7 @@ function findCallerClassName(stackFrames, tracedClassName) {
     return null;
 }
 
+const hookedFlutterResultClasses = new Set();
 const describedClassShapes = new Set();
 
 /**
@@ -346,15 +347,151 @@ function describeClassShapeOnce(className) {
 }
 
 /**
+ * Flutter's MethodChannel.MethodCallHandler.onMethodCall(MethodCall, Result)
+ * is a semantically special shape: args[0] names which channel method was
+ * actually invoked, args[1] is how the answer gets sent back to Dart.
+ * Generic tracing only shows toString() of these two objects, which isn't
+ * useful -- this extracts the real invoked method name directly via
+ * reflection, and the first time it sees a given Result implementation,
+ * auto-discovers and hooks its success()/error()/notImplemented() so the
+ * exact value crossing the Java/Dart platform-channel boundary is visible.
+ * A method literally named "onMethodCall" is not proof it's actually
+ * Flutter's interface -- some apps have their own, unrelated method of
+ * the same name -- so if the argument turns out not to be Flutter's real
+ * MethodCall/Result, the discovered real class gets its shape dumped via
+ * describeClassShapeOnce() instead of silently producing nulls.
+ */
+function tryHookFlutterMethodCallHandler(Klass, className, methodName) {
+    if (methodName !== "onMethodCall") return false;
+    try {
+        const overloads = Klass[methodName].overloads;
+        const twoArgOverloads = overloads.filter((ov) => ov.argumentTypes.length === 2);
+        if (twoArgOverloads.length === 0) return false;
+
+        // R8 can generate a synthetic bridge method for an interface
+        // implementation -- Object,Object args that just cast and delegate
+        // to the real typed one. Prefer the overload actually typed as
+        // MethodCall; if that's not found (and only then), fall back to
+        // whatever 2-arg overload exists, but log every overload's real
+        // argument types so a bridge-method mismatch is directly visible
+        // in evidence rather than silently producing null fields again.
+        const typed = twoArgOverloads.find(
+            (ov) => ov.argumentTypes[0].className === "io.flutter.plugin.common.MethodCall"
+        );
+        const target = typed || twoArgOverloads[0];
+        if (!typed) {
+            log(
+                MODULE_NAME, "debug",
+                `${className}.onMethodCall: no overload typed as MethodCall; ` +
+                `2-arg overloads found: ${twoArgOverloads.map((ov) => ov.argumentTypes.map((t) => t.className).join(",")).join(" | ")}`
+            );
+        }
+
+        target.implementation = function (call, result) {
+            const callInfo = describeArg(call);
+            const resultInfo = describeArg(result);
+
+            // "method" is Flutter's real field name on MethodCall. Some
+            // obfuscated builds expose an equivalent object under a
+            // different concrete type where the same value lands on a
+            // short, generated field name instead -- "a" is a common
+            // case in R8-minified output, so it's tried next. Read via
+            // reflection either way, not Frida's `.fieldName.value`
+            // sugar: a class can have both a field and a method sharing
+            // a name (common once an obfuscator has squashed everything
+            // down to single letters), and that sugar can silently
+            // resolve to the method wrapper -- which has no `.value`, so
+            // it produces `undefined` instead of throwing. Reflection's
+            // Field/Method namespaces don't collide, so this can't
+            // repeat that failure mode.
+            let invokedMethod = null;
+            let invokedMethodField = null;
+            for (const fieldName of ["method", "a"]) {
+                const value = readFieldViaReflection(call, fieldName);
+                if (value !== undefined) {
+                    invokedMethod = value;
+                    invokedMethodField = fieldName;
+                    break;
+                }
+            }
+
+            event(MODULE_NAME, "flutter_method_channel_call", {
+                handler_class: className,
+                overload_was_typed: Boolean(typed),
+                call_class: callInfo.className,
+                call_is_null: callInfo.isNull,
+                call_js_type: callInfo.jsType,
+                result_class: resultInfo.className,
+                result_is_null: resultInfo.isNull,
+                result_js_type: resultInfo.jsType,
+                invoked_method: invokedMethod,
+                invoked_method_field: invokedMethodField,
+            });
+
+            // Placeholder error strings from describeArg() aren't real
+            // class names -- don't feed them to Java.use().
+            const realClassName = (name) => (typeof name === "string" && !name.startsWith("<error:") ? name : null);
+
+            describeClassShapeOnce(realClassName(callInfo.className));
+            describeClassShapeOnce(realClassName(resultInfo.className));
+
+            const resultClass = realClassName(resultInfo.className);
+            if (resultClass && !resultInfo.isNull) hookFlutterResultReplyOnce(resultClass);
+
+            return this.onMethodCall(call, result);
+        };
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+/** Hooks success()/error()/notImplemented() on a discovered concrete MethodChannel.Result implementation, exactly once. */
+function hookFlutterResultReplyOnce(resultClassName) {
+    if (hookedFlutterResultClasses.has(resultClassName)) return;
+    hookedFlutterResultClasses.add(resultClassName);
+
+    try {
+        const ResultClass = Java.use(resultClassName);
+        ["success", "error", "notImplemented"].forEach((methodName) => {
+            try {
+                ResultClass[methodName].overloads.forEach((overload) => {
+                    overload.implementation = function (...args) {
+                        event(MODULE_NAME, "flutter_method_channel_reply", {
+                            result_class: resultClassName,
+                            method: methodName,
+                            args: args.map(safeStringify),
+                        });
+                        return this[methodName](...args);
+                    };
+                });
+            } catch (e) {
+                // This concrete Result impl may not exposed all three -- skip.
+            }
+        });
+        log(MODULE_NAME, "info", `Hooked Flutter MethodChannel.Result reply methods on ${resultClassName}`);
+    } catch (e) {
+        log(MODULE_NAME, "error", `Failed to hook discovered Result class ${resultClassName}: ${e.stack || e}`);
+    }
+}
+
+/**
  * Generic "trace (and, when bypass is enabled, neutralize) every method
  * on a known class" -- for when a library's presence is confirmed (e.g.
  * RootBeer/RootBeerNative showing up in enumerateSuspiciousClasses())
  * but it's unclear which of its many methods the app actually calls.
  * Guessing individual method names one at a time doesn't scale for a
  * library with a dozen-plus leaf checks; this hooks everything the
- * class declares, logs every call with its real result and JS type, and
- * auto-discovers + recursively traces whoever called it, so the actual
- * caller doesn't have to be hardcoded per app.
+ * class declares, logs every call with its real result and JS type
+ * (RootBeerNative.checkForRoot returns `int`, not `boolean` -- a prior
+ * version of this bypass compared `result === true`, which can never
+ * match a number; fixed to a truthy check), and auto-discovers +
+ * recursively traces whoever called it, so the actual caller (e.g. a
+ * Flutter plugin's obfuscated glue class) doesn't have to be hardcoded
+ * per app. May install a second `.implementation` over a hook
+ * fs_monitor already set on the same method (e.g. RootBeerNative.
+ * checkForRoot) when both modules run together -- harmless, since this
+ * one is a strict superset (same call-through + bypass-on-truthy logic).
  */
 function traceAndNeutralizeClass(className, depth = 0) {
     if (tracedClassNames.has(className)) return;
@@ -377,6 +514,10 @@ function traceAndNeutralizeClass(className, depth = 0) {
 
     let hookedCount = 0;
     for (const methodName of methodNames) {
+        if (tryHookFlutterMethodCallHandler(Klass, className, methodName)) {
+            hookedCount += 1;
+            continue;
+        }
         try {
             Klass[methodName].overloads.forEach((overload) => {
                 overload.implementation = function (...args) {
@@ -403,10 +544,12 @@ function traceAndNeutralizeClass(className, depth = 0) {
 
                     // Frida's Java bridge enforces that the returned value is
                     // compatible with the method's *declared* return type --
-                    // some native-backed detectors declare an `int` result
-                    // rather than `boolean`, so unconditionally returning the
-                    // JS boolean `false` here can throw "expected return
-                    // value compatible with int".
+                    // RootBeerNative.checkForRoot()/setLogDebugMessages() are
+                    // both declared `native int`, not `boolean` (confirmed
+                    // against RootBeer's real source), so unconditionally
+                    // returning the JS boolean `false` here throws
+                    // "expected return value compatible with int" and can
+                    // corrupt whatever call chain was mid-flight when it did.
                     if (!bypassed) return result;
                     return typeof result === "number" ? 0 : false;
                 };
