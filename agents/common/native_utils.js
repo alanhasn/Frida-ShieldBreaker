@@ -68,3 +68,36 @@ export function bytesToHex(buffer) {
         .map((b) => b.toString(16).padStart(2, "0"))
         .join("");
 }
+
+/** Reads a NUL-terminated C string from `pointer`, or null on a null pointer or read failure. */
+export function readCString(pointer) {
+    if (pointer === null || pointer === undefined || pointer.isNull()) return null;
+    try {
+        return pointer.readCString();
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Returns every currently loaded module whose name case-insensitively
+ * equals, or contains as a substring, one of `candidateNames`. Substring
+ * matching covers platform/vendor naming variance (e.g. a renamed copy of
+ * a shared object, or a bare framework binary name on iOS) without any
+ * caller needing to hardcode an exact name. Used for locating a specific
+ * embedded runtime (e.g. a cross-platform framework's own native library)
+ * rather than resolving a symbol against whatever module happens to
+ * export it first.
+ */
+export function findModules(candidateNames) {
+    if (!Array.isArray(candidateNames) || candidateNames.length === 0) return [];
+    const lowerCandidates = candidateNames.map((name) => String(name).toLowerCase());
+    try {
+        return Process.enumerateModules().filter((m) => {
+            const lowerName = m.name.toLowerCase();
+            return lowerCandidates.some((candidate) => lowerName === candidate || lowerName.includes(candidate));
+        });
+    } catch (e) {
+        return [];
+    }
+}
