@@ -59,17 +59,33 @@ function readServerName(sslPtr) {
     }
 }
 
-function hookSslCtxSetVerify() {
-    const resolved = resolveExport([[null, "SSL_CTX_set_verify"]]);
+/**
+ * Builds resolveExport() candidates for `symbolName` scoped to
+ * `moduleNames` -- a list of concrete module names to search, or the
+ * default `[null]` (Frida's process-wide wildcard, searching every
+ * loaded module and returning the first match). Scoping to a specific
+ * module matters when more than one loaded module could export the same
+ * symbol (e.g. a statically-linked copy bundled inside an app's own
+ * native library alongside a system TLS library) and the wildcard's
+ * first-match behavior isn't guaranteed to pick the one that matters.
+ */
+function moduleScopedCandidates(moduleNames, symbolName) {
+    const modules = Array.isArray(moduleNames) && moduleNames.length > 0 ? moduleNames : [null];
+    return modules.map((moduleName) => [moduleName, symbolName]);
+}
+
+function hookSslCtxSetVerify(moduleNames) {
+    const resolved = resolveExport(moduleScopedCandidates(moduleNames, "SSL_CTX_set_verify"));
     if (resolved === null) {
         log(MODULE_NAME, "debug", "SSL_CTX_set_verify: no matching export found");
-        return;
+        return { symbol: "SSL_CTX_set_verify", installed: false };
     }
     attachSafe(MODULE_NAME, resolved.address, {
         onEnter(args) {
             const requestedMode = args[1].toInt32();
             reportPinning("SSL_CTX_set_verify", {
                 symbol: `${resolved.moduleName}!${resolved.symbolName}`,
+                module: resolved.moduleName,
                 requestedMode,
             });
             if (bypassEnabled) {
@@ -78,13 +94,14 @@ function hookSslCtxSetVerify() {
         },
     });
     log(MODULE_NAME, "debug", `Hooked SSL_CTX_set_verify -> ${resolved.moduleName}!${resolved.symbolName}`);
+    return { symbol: "SSL_CTX_set_verify", installed: true, moduleName: resolved.moduleName };
 }
 
-function hookSslGetVerifyResult() {
-    const resolved = resolveExport([[null, "SSL_get_verify_result"]]);
+function hookSslGetVerifyResult(moduleNames) {
+    const resolved = resolveExport(moduleScopedCandidates(moduleNames, "SSL_get_verify_result"));
     if (resolved === null) {
         log(MODULE_NAME, "debug", "SSL_get_verify_result: no matching export found");
-        return;
+        return { symbol: "SSL_get_verify_result", installed: false };
     }
     attachSafe(MODULE_NAME, resolved.address, {
         onEnter(args) {
@@ -96,6 +113,7 @@ function hookSslGetVerifyResult() {
             const bypassed = bypassEnabled;
             reportPinning("SSL_get_verify_result", {
                 symbol: `${resolved.moduleName}!${resolved.symbolName}`,
+                module: resolved.moduleName,
                 originalResult,
                 hostname: readServerName(this.ssl),
                 bypassed,
@@ -106,13 +124,17 @@ function hookSslGetVerifyResult() {
         },
     });
     log(MODULE_NAME, "debug", `Hooked SSL_get_verify_result -> ${resolved.moduleName}!${resolved.symbolName}`);
+    return { symbol: "SSL_get_verify_result", installed: true, moduleName: resolved.moduleName };
 }
 
-function hookSslSetCustomVerify() {
-    const resolved = resolveExport([[null, "SSL_set_custom_verify"], [null, "SSL_CTX_set_custom_verify"]]);
+function hookSslSetCustomVerify(moduleNames) {
+    const resolved = resolveExport([
+        ...moduleScopedCandidates(moduleNames, "SSL_set_custom_verify"),
+        ...moduleScopedCandidates(moduleNames, "SSL_CTX_set_custom_verify"),
+    ]);
     if (resolved === null) {
         log(MODULE_NAME, "debug", "SSL_set_custom_verify: no matching export found");
-        return;
+        return { symbol: "SSL_set_custom_verify", installed: false };
     }
 
     // BoringSSL's custom_verify callback is arbitrary app-native code --
@@ -128,13 +150,17 @@ function hookSslSetCustomVerify() {
 
     attachSafe(MODULE_NAME, resolved.address, {
         onEnter(args) {
-            reportPinning("SSL_set_custom_verify", { symbol: `${resolved.moduleName}!${resolved.symbolName}` });
+            reportPinning("SSL_set_custom_verify", {
+                symbol: `${resolved.moduleName}!${resolved.symbolName}`,
+                module: resolved.moduleName,
+            });
             if (bypassEnabled) {
                 args[2] = alwaysOk;
             }
         },
     });
     log(MODULE_NAME, "debug", `Hooked SSL_set_custom_verify -> ${resolved.moduleName}!${resolved.symbolName}`);
+    return { symbol: "SSL_set_custom_verify", installed: true, moduleName: resolved.moduleName };
 }
 
 function hookSecTrustEvaluateWithError() {
@@ -187,6 +213,32 @@ function installNativeTlsHooks() {
     hookSslSetCustomVerify();
     hookSecTrustEvaluateWithError();
     hookSecTrustEvaluate();
+}
+
+/**
+ * Installs the OpenSSL/BoringSSL hooks (SSL_CTX_set_verify,
+ * SSL_get_verify_result, SSL_set_custom_verify/SSL_CTX_set_custom_verify)
+ * scoped to a specific set of module-name candidates, rather than the
+ * process-wide wildcard search installNativeTlsHooks() uses by default.
+ *
+ * Exists for callers that have already identified exactly which loaded
+ * module owns a statically-linked copy of OpenSSL/BoringSSL -- e.g. a
+ * cross-platform framework's own native library -- and want it hooked
+ * directly rather than relying on whichever module Frida's process-wide
+ * export search happens to match first. SecTrust (iOS) is intentionally
+ * left out: it's a single system framework, not something an app bundles
+ * its own copy of, so module scoping doesn't apply to it.
+ *
+ * Returns one install-result descriptor per attempted symbol so the
+ * caller can report its own setup diagnostics (hook installed vs.
+ * unavailable) without needing to know how each hook resolves its export.
+ */
+export function installNativeTlsHooksForModules(moduleNames) {
+    return [
+        hookSslCtxSetVerify(moduleNames),
+        hookSslGetVerifyResult(moduleNames),
+        hookSslSetCustomVerify(moduleNames),
+    ];
 }
 
 // --------------------------------------------------------------------
