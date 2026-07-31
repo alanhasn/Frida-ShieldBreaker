@@ -1,0 +1,323 @@
+// Diagnostic recon module -- NOT a permanent bypass, a one-time
+// investigative tool for when known detection vectors (fs_monitor's
+// path/PackageManager checks, etc.) have all been confirmed bypassed
+// yet the app still reacts to root/tamper detection. Guessing at
+// individual APIs one at a time doesn't scale once a commercial RASP
+// SDK is involved -- this instead makes the app tell us what fired:
+//
+//   1. Enumerates loaded classes matching common root/tamper/RASP-SDK
+//      naming patterns and reports the list -- often reveals which SDK
+//      is in play by name alone (e.g. a class under a vendor's package).
+//   2. Hooks generic "reaction points" many such SDKs funnel into once
+//      they've decided to react to a positive detection (show a block
+//      dialog, finish the activity, kill the process) and captures a
+//      Java stack trace at the moment each fires, so the exact call
+//      chain leading to the block screen is visible.
+//
+// Expect noisy output: Dialog.show()/Activity.finish() fire for
+// completely unrelated, legitimate UI too. Read for the frame near the
+// moment the block screen actually appears, then hand the offending
+// class/method to fs_monitor (or a new hook) for an actual bypass.
+
+import { log, event } from "../common/rpc.js";
+import { isAndroid } from "../common/native_utils.js";
+
+const MODULE_NAME = "recon";
+
+let bypassEnabled = false;
+
+// Classes to fully trace once their presence is confirmed (e.g. via
+// enumerateSuspiciousClasses() below) -- rather than guessing which
+// specific method of a multi-method detection library the app actually
+// calls, every declared method gets hooked and logged.
+const KNOWN_LIBRARY_CLASSES_TO_TRACE = [
+    "com.scottyab.rootbeer.RootBeer",
+    "com.scottyab.rootbeer.RootBeerNative",
+];
+
+const SUSPICIOUS_CLASS_NAME_MARKERS = [
+    "root", "magisk", "tamper", "integrity", "rasp", "shield",
+    "frida", "xposed", "antidebug", "anti_debug", "security",
+    "safetynet", "playintegrity", "jailbreak", "hook",
+];
+
+// AOSP/language-runtime package prefixes -- excluded from the keyword
+// scan below. Matches here (android.security.* is the KeyStore/Keymaster
+// API, android.view.ViewRootImpl is UI-tree plumbing, org.apache.xml.*
+// is XML parsing internals, none of it detection code) are essentially
+// always framework noise that drowns out the handful of classes that
+// actually matter.
+const FRAMEWORK_PACKAGE_PREFIXES = [
+    "android.", "androidx.", "com.android.", "java.", "javax.",
+    "libcore.", "dalvik.", "org.apache.", "org.json.", "org.xml.",
+    "org.w3c.", "sun.", "kotlin.", "kotlinx.", "com.google.android.",
+];
+
+function isFrameworkClass(className) {
+    return FRAMEWORK_PACKAGE_PREFIXES.some((prefix) => className.startsWith(prefix));
+}
+
+// Package prefixes for widely-used commercial mobile RASP/anti-tamper
+// SDKs. Checked directly rather than by generic keyword -- a much more
+// precise signal, since a hit here names the actual product in play.
+const KNOWN_RASP_SDK_PREFIXES = [
+    "com.talsec.", "io.talsec.",                       // Talsec freeRASP
+    "io.zimperium.", "com.zimperium.",                  // Zimperium zDefend/zIAP
+    "com.promon.", "no.promon.",                        // Promon SHIELD
+    "com.guardsquare.", "com.dexguard.",                 // GuardSquare DexGuard RASP
+    "com.appdome.",                                      // Appdome
+    "com.arxan.", "com.digital.ai.", "com.digitalai.",   // Arxan / Digital.ai
+    "com.oneupsecurity.",
+    "com.trustlook.",
+    "com.avast.", "io.avast.",
+    "com.ensurity.",
+    "com.vkey.",
+];
+
+// If MainActivity is (near enough) the *only* class under the app's own
+// package, its real logic likely isn't Java at all -- these are the
+// tell-tale loaded-class prefixes for the cross-platform frameworks that
+// would explain that, and where root/jailbreak detection would then run
+// in Dart/JS/IL instead of anything a Java-level Frida hook can see.
+const CROSS_PLATFORM_FRAMEWORK_MARKERS = [
+    { name: "Flutter", prefixes: ["io.flutter."] },
+    { name: "React Native", prefixes: ["com.facebook.react.", "com.facebook.hermes.", "com.facebook.jni.", "com.facebook.soloader."] },
+    { name: "Cordova", prefixes: ["org.apache.cordova."] },
+    { name: "Capacitor", prefixes: ["com.getcapacitor."] },
+    { name: "Unity", prefixes: ["com.unity3d."] },
+];
+
+const REACTION_POINTS = [
+    { className: "android.app.Dialog", methodName: "show", label: "Dialog.show (covers AlertDialog + subclasses)" },
+    { className: "android.app.Activity", methodName: "finish", label: "Activity.finish" },
+    { className: "java.lang.System", methodName: "exit", label: "System.exit" },
+    { className: "android.os.Process", methodName: "killProcess", label: "Process.killProcess" },
+];
+
+function currentStackTrace(maxFrames = 15) {
+    try {
+        const Thread = Java.use("java.lang.Thread");
+        const frames = Thread.currentThread().getStackTrace();
+        const lines = [];
+        for (let i = 0; i < frames.length && lines.length < maxFrames; i++) {
+            lines.push(frames[i].toString());
+        }
+        return lines;
+    } catch (e) {
+        return [];
+    }
+}
+
+function getOwnPackageName() {
+    try {
+        const app = Java.use("android.app.ActivityThread").currentApplication();
+        return app ? app.getPackageName() : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Four-tier scan, most-precise first:
+ *   1. Classes under the app's own package -- this is where custom or
+ *      even obfuscated detection code actually lives, and it's a small
+ *      enough set that nothing drowns it out. If this stays tiny (e.g.
+ *      just MainActivity) even once the app is fully running, the real
+ *      logic likely isn't Java at all -- see tier 2.
+ *   2. Cross-platform framework markers (Flutter/React Native/Cordova/
+ *      Capacitor/Unity) -- answers that directly: if one of these is
+ *      loaded, root/jailbreak detection is probably running in Dart/JS/
+ *      IL, invisible to every Java hook this framework has written.
+ *   3. Known commercial RASP SDK package prefixes -- a hit here names
+ *      the actual product in play directly, no guessing required.
+ *   4. Generic keyword matches, with AOSP/runtime packages excluded --
+ *      catches anything the first three tiers miss, at the cost of some
+ *      remaining noise from third-party libraries that happen to use
+ *      words like "security" for unrelated reasons.
+ */
+function enumerateSuspiciousClasses() {
+    const ownPackage = getOwnPackageName();
+    const ownClasses = [];
+    const frameworkHits = new Map(); // framework name -> example class names
+    const raspMatches = [];
+    const keywordMatches = [];
+
+    try {
+        Java.enumerateLoadedClasses({
+            onMatch(className) {
+                if (ownPackage && className.startsWith(`${ownPackage}.`)) {
+                    ownClasses.push(className);
+                    return;
+                }
+                for (const { name, prefixes } of CROSS_PLATFORM_FRAMEWORK_MARKERS) {
+                    if (prefixes.some((prefix) => className.startsWith(prefix))) {
+                        const examples = frameworkHits.get(name) ?? [];
+                        if (examples.length < 5) examples.push(className);
+                        frameworkHits.set(name, examples);
+                        return;
+                    }
+                }
+                if (KNOWN_RASP_SDK_PREFIXES.some((prefix) => className.startsWith(prefix))) {
+                    raspMatches.push(className);
+                    return;
+                }
+                if (isFrameworkClass(className)) return;
+                const lower = className.toLowerCase();
+                if (SUSPICIOUS_CLASS_NAME_MARKERS.some((marker) => lower.includes(marker))) {
+                    keywordMatches.push(className);
+                }
+            },
+            onComplete() {
+                const frameworksDetected = Object.fromEntries(frameworkHits);
+                event(MODULE_NAME, "suspicious_classes_found", {
+                    own_package: ownPackage,
+                    own_classes_count: ownClasses.length,
+                    own_classes: ownClasses,
+                    cross_platform_frameworks_detected: frameworksDetected,
+                    known_rasp_sdk_matches: raspMatches,
+                    keyword_matches_count: keywordMatches.length,
+                    keyword_matches: keywordMatches.slice(0, 100),
+                });
+                const frameworkNames = [...frameworkHits.keys()];
+                log(
+                    MODULE_NAME, "info",
+                    `Recon: ${ownClasses.length} class(es) under own package (${ownPackage}), ` +
+                    `cross-platform framework(s): ${frameworkNames.length ? frameworkNames.join(", ") : "none detected"}, ` +
+                    `${raspMatches.length} known-RASP-SDK match(es), ${keywordMatches.length} generic keyword match(es) (framework excluded)`
+                );
+                if (ownClasses.length <= 2 && frameworkNames.length === 0) {
+                    log(
+                        MODULE_NAME, "warning",
+                        "Own package has almost no classes and no cross-platform framework was detected at this point in startup -- " +
+                        "if detection still isn't found, consider re-running after more of the app has loaded, or that native (non-JVM) " +
+                        "code loaded via System.loadLibrary() may be doing the check outside anything Java-visible."
+                    );
+                }
+            },
+        });
+    } catch (e) {
+        log(MODULE_NAME, "error", `Class enumeration failed: ${e.stack || e}`);
+    }
+}
+
+function hookReactionPoint(className, methodName, label) {
+    try {
+        const Klass = Java.use(className);
+        Klass[methodName].implementation = function (...args) {
+            event(MODULE_NAME, "reaction_point_hit", {
+                label,
+                class: className,
+                method: methodName,
+                stack: currentStackTrace(),
+            });
+            return this[methodName](...args);
+        };
+        log(MODULE_NAME, "debug", `Hooked reaction point: ${label}`);
+    } catch (e) {
+        log(MODULE_NAME, "debug", `Reaction point not present: ${label} (${e.message})`);
+    }
+}
+
+function installReactionPointHooks() {
+    for (const { className, methodName, label } of REACTION_POINTS) {
+        hookReactionPoint(className, methodName, label);
+    }
+}
+
+function safeStringify(value) {
+    if (value === null || value === undefined) return String(value);
+    if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") return value;
+    try {
+        return value.toString();
+    } catch (e) {
+        return "<unstringifiable>";
+    }
+}
+
+// Every class this session has already installed a tracer on -- de-dupes
+// repeat calls against the same class.
+const tracedClassNames = new Set();
+
+/**
+ * Generic "trace (and, when bypass is enabled, neutralize) every method
+ * on a known class" -- for when a library's presence is confirmed (e.g.
+ * RootBeer/RootBeerNative showing up in enumerateSuspiciousClasses())
+ * but it's unclear which of its many methods the app actually calls.
+ * Guessing individual method names one at a time doesn't scale for a
+ * library with a dozen-plus leaf checks; this hooks everything the
+ * class declares and logs every call with its real result and JS type.
+ */
+function traceAndNeutralizeClass(className) {
+    if (tracedClassNames.has(className)) return;
+    tracedClassNames.add(className);
+
+    let Klass;
+    try {
+        Klass = Java.use(className);
+    } catch (e) {
+        return; // class not present in this app
+    }
+
+    let methodNames;
+    try {
+        methodNames = [...new Set(Klass.class.getDeclaredMethods().map((m) => m.getName()))];
+    } catch (e) {
+        log(MODULE_NAME, "error", `Failed to enumerate methods of ${className}: ${e.stack || e}`);
+        return;
+    }
+
+    let hookedCount = 0;
+    for (const methodName of methodNames) {
+        try {
+            Klass[methodName].overloads.forEach((overload) => {
+                overload.implementation = function (...args) {
+                    const result = this[methodName](...args);
+                    const bypassed = bypassEnabled && Boolean(result);
+                    event(MODULE_NAME, "library_method_trace", {
+                        class: className,
+                        method: methodName,
+                        args: args.map(safeStringify),
+                        result: safeStringify(result),
+                        result_type: typeof result,
+                        bypassed,
+                    });
+
+                    // Frida's Java bridge enforces that the returned value is
+                    // compatible with the method's *declared* return type --
+                    // some native-backed detectors declare an `int` result
+                    // rather than `boolean`, so unconditionally returning the
+                    // JS boolean `false` here can throw "expected return
+                    // value compatible with int".
+                    if (!bypassed) return result;
+                    return typeof result === "number" ? 0 : false;
+                };
+            });
+            hookedCount += 1;
+        } catch (e) {
+            // Some methods can't be hooked this way (private native
+            // helpers with no resolvable overload, etc.) -- skip.
+        }
+    }
+    log(MODULE_NAME, "info", `Traced ${hookedCount}/${methodNames.length} method(s) on ${className}`);
+}
+
+function traceKnownLibraries() {
+    for (const className of KNOWN_LIBRARY_CLASSES_TO_TRACE) {
+        traceAndNeutralizeClass(className);
+    }
+}
+
+export function init(config = {}) {
+    bypassEnabled = Boolean(config.bypass);
+
+    if (!isAndroid()) {
+        log(MODULE_NAME, "warning", "recon currently only implements Android hooks");
+        return;
+    }
+    Java.perform(() => {
+        enumerateSuspiciousClasses();
+        installReactionPointHooks();
+        traceKnownLibraries();
+    });
+    log(MODULE_NAME, "info", "recon hooks installed", { bypass: bypassEnabled });
+}

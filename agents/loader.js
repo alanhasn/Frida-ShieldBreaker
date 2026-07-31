@@ -17,6 +17,7 @@ import { platformInfo } from "./common/native_utils.js";
 import * as fsMonitor from "./fs_monitor/fs_monitor.js";
 import * as tlsInspector from "./tls_inspector/tls_inspector.js";
 import * as antiDebug from "./anti_debug/anti_debug.js";
+import * as recon from "./recon/recon.js";
 
 const MODULE_NAME = "loader";
 
@@ -24,6 +25,7 @@ const MODULE_REGISTRY = {
     fs: fsMonitor,
     tls: tlsInspector,
     antidebug: antiDebug,
+    recon,
 };
 
 /**
