@@ -1,0 +1,13 @@
+# Normalize line endings to LF in the repository regardless of the
+# platform a contributor checks out or commits from.
+* text=auto eol=lf
+
+*.js text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+
+# Generated/vendored files: exclude from diffs and GitHub's language stats.
+package-lock.json linguist-generated=true -diff
+agents/dist/** linguist-generated=true -diff linguist-vendored

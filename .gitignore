@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+reports/*.log
+reports/*.json
+node_modules/
+agents/dist/
+*.egg-info/
