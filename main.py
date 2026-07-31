@@ -14,6 +14,7 @@ Example usage:
     python main.py run 1234 --attach --agent agents/dist/agent.js
     python main.py run com.example.app --usb --spawn \\
         --modules fs,tls,antidebug,flutter_tls --bypass
+    python main.py run com.example.app --usb --spawn --auto --bypass
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from core.loader import AttachedTarget, FridaLoader, LoaderConfig, LoaderError, 
 from core.logger import console, get_logger, setup_logging
 
 DEFAULT_AGENT_PATH = Path("agents/dist/agent.js")
+DEFAULT_MODULES = "fs,tls,antidebug"
 
 logger = get_logger("cli")
 
@@ -70,20 +72,29 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Path to the compiled JS agent bundle (default: {DEFAULT_AGENT_PATH}).",
     )
     run_parser.add_argument(
-        "--modules", type=str, default="fs,tls,antidebug",
-        help="Comma-separated module toggles forwarded to the agent's init payload (default: all).",
+        "--modules", type=str, default=None,
+        help="Comma-separated module toggles forwarded to the agent's init payload "
+             f"(default: {DEFAULT_MODULES}, unless --auto selects modules automatically). "
+             "Passing this explicitly always wins over --auto.",
     )
     run_parser.add_argument("--no-resume", action="store_true", help="Load the agent but leave the process suspended.")
     run_parser.add_argument("--kill-on-exit", action="store_true", help="Kill the target on exit (only if we spawned it).")
     run_parser.add_argument(
         "--bypass", action="store_true",
         help="Actively bypass detected checks (spoof return values) instead of only tracing them. "
-             "Applies to every enabled module that supports it (fs, tls, antidebug, flutter_tls).",
+             "Applies to every enabled module that supports it (fs, tls, antidebug, flutter_tls), "
+             "whether enabled explicitly or via --auto.",
     )
     run_parser.add_argument(
         "--module-config", type=str, default=None, metavar="JSON",
         help='Raw JSON merged into each module\'s init config, e.g. \'{"fs": {"extra_markers": ["myroot"]}}\'. '
              "Overrides --bypass on a per-module basis.",
+    )
+    run_parser.add_argument(
+        "--auto", "--detect", dest="auto", action="store_true",
+        help="Automatically detect the target's framework (Flutter, React Native, Unity, Xamarin, "
+             "Cordova, Capacitor, or native Android) at runtime and enable only the modules relevant "
+             "to it, instead of the fixed default set. Ignored if --modules is also given explicitly.",
     )
     run_parser.add_argument(
         "--retry-spawn", type=int, default=1, metavar="N",
@@ -149,12 +160,13 @@ def cmd_ps(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     config = _loader_config_from_args(args)
-    modules = [m.strip() for m in args.modules.split(",") if m.strip()]
+
+    # Explicit --modules always wins over --auto; --auto only takes effect
+    # when the user hasn't told us exactly what to run.
+    explicit_modules = args.modules is not None
+    auto_detect = bool(args.auto) and not explicit_modules
 
     module_config: dict[str, dict] = {}
-    if args.bypass:
-        for name in modules:
-            module_config.setdefault(name, {})["bypass"] = True
     if args.module_config:
         try:
             overrides = json.loads(args.module_config)
@@ -163,7 +175,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         for name, cfg in overrides.items():
             module_config.setdefault(name, {}).update(cfg)
 
-    init_payload = {"enabled_modules": modules, "module_config": module_config}
+    # default_bypass is applied uniformly by the agent to every module it
+    # ends up enabling, whether that list came from enabled_modules below
+    # or -- when auto_detect is true -- from the agent's own framework
+    # detection, which main.py can't enumerate in advance.
+    init_payload = {
+        "module_config": module_config,
+        "default_bypass": bool(args.bypass),
+        "auto_detect": auto_detect,
+    }
+    if not auto_detect:
+        modules_str = args.modules if explicit_modules else DEFAULT_MODULES
+        init_payload["enabled_modules"] = [m.strip() for m in modules_str.split(",") if m.strip()]
 
     with FridaLoader(config) as loader:
         target: AttachedTarget
