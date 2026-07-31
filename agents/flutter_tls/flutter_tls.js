@@ -26,6 +26,7 @@
 
 import { log, event } from "../common/rpc.js";
 import { isAndroid, findModules, readCString } from "../common/native_utils.js";
+import { installNativeTlsHooksForModules } from "../tls_inspector/tls_inspector.js";
 
 const MODULE_NAME = "flutter_tls";
 
@@ -99,6 +100,132 @@ function inspectDartRuntime(engineModules) {
 }
 
 // --------------------------------------------------------------------
+// Native TLS stack identification
+// --------------------------------------------------------------------
+
+// Exported names that indicate a module carries its own OpenSSL/BoringSSL
+// rather than merely linking against the system's. Presence is checked
+// per-module (not process-wide) so the result reflects exactly what the
+// discovered Flutter engine module exports, not whatever other TLS
+// library happens to also be loaded in the process.
+const TLS_SYMBOL_CANDIDATES = [
+    "SSL_CTX_new",
+    "SSL_CTX_set_verify",
+    "SSL_CTX_set_custom_verify",
+    "SSL_set_custom_verify",
+    "SSL_get_verify_result",
+    "X509_verify_cert",
+];
+
+/**
+ * Best-effort library version string. BoringSSL deliberately does not
+ * export a friendly version banner the way classic OpenSSL does, so
+ * absence here is expected and not itself evidence of anything -- this
+ * is purely a nice-to-have when the bundled library happens to be a
+ * build of OpenSSL rather than BoringSSL.
+ */
+function readLibraryVersionString(moduleName) {
+    for (const symbol of ["OpenSSL_version", "SSLeay_version"]) {
+        let address;
+        try {
+            address = Module.findExportByName(moduleName, symbol);
+        } catch (e) {
+            continue;
+        }
+        if (address === null || address === undefined) continue;
+        try {
+            const fn = new NativeFunction(address, "pointer", ["int"]);
+            const version = readCString(fn(0)); // 0 == OPENSSL_VERSION / SSLEAY_VERSION
+            if (version) return version;
+        } catch (e) {
+            // best-effort only
+        }
+    }
+    return null;
+}
+
+/**
+ * Probes each discovered engine module for the TLS symbol candidates and
+ * reports what's actually present. Returns only the modules where at
+ * least one symbol was found -- those are the ones worth handing to the
+ * bypass strategies below; a module with none of these exports isn't a
+ * TLS implementation, whatever else it might be.
+ */
+function identifyNativeTlsStack(engineModules) {
+    const modulesWithTls = [];
+    for (const mod of engineModules) {
+        const symbolsFound = TLS_SYMBOL_CANDIDATES.filter((symbol) => {
+            try {
+                return Module.findExportByName(mod.name, symbol) !== null;
+            } catch (e) {
+                return false;
+            }
+        });
+        if (symbolsFound.length === 0) continue;
+
+        event(MODULE_NAME, "native_tls_library_detected", {
+            module: mod.name,
+            symbols_found: symbolsFound,
+            library_version: readLibraryVersionString(mod.name),
+        });
+        modulesWithTls.push(mod);
+    }
+    return modulesWithTls;
+}
+
+// --------------------------------------------------------------------
+// Bypass strategies
+// --------------------------------------------------------------------
+
+/**
+ * Extension point for Flutter-specific TLS bypass techniques. Each entry
+ * is `{ name, description, apply(moduleNames) }`, where `apply` performs
+ * the actual hook installation and returns an array of
+ * `{ symbol, installed, moduleName? }` descriptors (the same shape
+ * tls_inspector's installNativeTlsHooksForModules returns) so the caller
+ * can report setup diagnostics uniformly regardless of which strategy
+ * produced them. A future strategy (e.g. one targeting a different
+ * native TLS implementation, or a additional native choke point) can be
+ * added here without changing how it's invoked or reported.
+ */
+const TLS_BYPASS_STRATEGIES = [
+    {
+        name: "native_boringssl_custom_verify",
+        description:
+            "Neutralizes verification performed through the engine's own statically-linked " +
+            "OpenSSL/BoringSSL, by reusing tls_inspector's native hooks scoped to the " +
+            "discovered engine module(s).",
+        apply(moduleNames) {
+            return installNativeTlsHooksForModules(moduleNames);
+        },
+    },
+];
+
+function applyBypassStrategies(moduleNames) {
+    for (const strategy of TLS_BYPASS_STRATEGIES) {
+        try {
+            const results = strategy.apply(moduleNames);
+            for (const result of results) {
+                if (result.installed) {
+                    event(MODULE_NAME, "hook_installed", {
+                        strategy: strategy.name,
+                        symbol: result.symbol,
+                        module: result.moduleName,
+                    });
+                } else {
+                    event(MODULE_NAME, "hook_installation_failed", {
+                        strategy: strategy.name,
+                        symbol: result.symbol,
+                    });
+                }
+            }
+        } catch (e) {
+            log(MODULE_NAME, "error", `Bypass strategy '${strategy.name}' threw: ${e.stack || e}`);
+        }
+    }
+}
+
+// --------------------------------------------------------------------
 // Entry point (called by agents/loader.js)
 // --------------------------------------------------------------------
 
@@ -145,9 +272,24 @@ export function init(config = {}) {
     }
 
     inspectDartRuntime(engineModules);
+    const modulesWithTls = identifyNativeTlsStack(engineModules);
+
+    if (modulesWithTls.length === 0) {
+        event(MODULE_NAME, "fallback_path_selected", {
+            reason: "no_recognizable_tls_symbols",
+            detail:
+                "No known OpenSSL/BoringSSL export names were found in any discovered " +
+                "engine module (possibly a stripped build). tls_inspector's own " +
+                "process-wide native hooks may still cover this app if it also loads a " +
+                "separate system TLS library.",
+        });
+    } else {
+        applyBypassStrategies(modulesWithTls.map((mod) => mod.name));
+    }
 
     log(MODULE_NAME, "info", "flutter_tls hooks installed", {
         bypass: bypassEnabled,
         native_modules_found: engineModules.length,
+        tls_capable_modules: modulesWithTls.length,
     });
 }
