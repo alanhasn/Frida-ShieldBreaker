@@ -100,6 +100,37 @@ function inspectDartRuntime(engineModules) {
 }
 
 // --------------------------------------------------------------------
+// Java-path cross-reference
+// --------------------------------------------------------------------
+
+// Presence of any of these indicates the app also has a Java-visible
+// networking path available (e.g. a plugin that shells out to platform
+// HTTP APIs instead of dart:io) -- tls_inspector's Android hooks already
+// install unconditionally on every Android target, so that path is
+// already covered without this module hooking anything itself.
+const JAVA_TLS_MARKER_CLASSES = ["okhttp3.CertificatePinner", "javax.net.ssl.X509TrustManager"];
+
+/** Presence-only check; must run inside Java.perform. Never installs a hook -- purely a cross-reference note. */
+function detectJavaTlsPathCoverage() {
+    const found = JAVA_TLS_MARKER_CLASSES.filter((className) => {
+        try {
+            Java.use(className);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    });
+    if (found.length === 0) return;
+
+    event(MODULE_NAME, "java_tls_path_detected", {
+        classes_found: found,
+        note:
+            "tls_inspector's Java hooks (TrustManager/OkHttp/WebView) already cover this " +
+            "path for any platform-channel networking this app may also use alongside dart:io.",
+    });
+}
+
+// --------------------------------------------------------------------
 // Native TLS stack identification
 // --------------------------------------------------------------------
 
@@ -185,7 +216,7 @@ function identifyNativeTlsStack(engineModules) {
  * tls_inspector's installNativeTlsHooksForModules returns) so the caller
  * can report setup diagnostics uniformly regardless of which strategy
  * produced them. A future strategy (e.g. one targeting a different
- * native TLS implementation, or a additional native choke point) can be
+ * native TLS implementation, or an additional native choke point) can be
  * added here without changing how it's invoked or reported.
  */
 const TLS_BYPASS_STRATEGIES = [
@@ -258,6 +289,12 @@ export function init(config = {}) {
             path: mod.path,
         })),
     });
+
+    if (isAndroid()) {
+        Java.perform(() => {
+            detectJavaTlsPathCoverage();
+        });
+    }
 
     if (engineModules.length === 0) {
         event(MODULE_NAME, "fallback_path_selected", {
