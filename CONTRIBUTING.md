@@ -63,6 +63,36 @@ and `npm run typecheck` to confirm the JS agent sources are well-formed.
 6. Add a toggle for the module in `main.py`'s `--modules` help text and this
    repository's `README.md` module table.
 
+## Adding a new framework detector
+
+`agents/framework_detection/` identifies the target's technology stack so
+`--auto` can enable the relevant modules automatically (see the
+[README's Automatic Framework Detection section](README.md#automatic-framework-detection)
+for how the engine and scoring work). To add a new one:
+
+1. Create `agents/framework_detection/<name>.js` exporting `detect()`,
+   returning `{ framework, confidence, evidence }`. Build the score with
+   `scoreEvidence()` from `./scoring.js`, given a list of
+   `{ present, weight, label }` checks — don't compute confidence by hand.
+2. Weight your single most distinctive marker (a class or native module
+   name unique to that framework) heavily enough to cross the detection
+   threshold (50) on its own. Native-library evidence may not be
+   available yet when detection runs (see the README section above for
+   why) — don't rely on it being present.
+3. Import your `detect()` in `detector.js` and add it to the `DETECTORS`
+   array.
+4. Add a `framework: [module, ...]` entry to `FRAMEWORK_MODULE_MAP` in
+   `detector.js`, and document it in `README.md`'s automatic-selection
+   table.
+5. If the new framework only applies to Android, add its primary marker
+   class to `native_android.js`'s exclusion list so "native Android"
+   stays accurate.
+
+Detectors must never throw (`detector.js` catches and logs regardless,
+but a well-behaved detector degrades to `confidence: 0` on its own) and
+must never install a hook — detection is evidence-only; the modules it
+selects are what actually instrument anything.
+
 ## Coding conventions
 
 - JavaScript agent code targets `es2022` as an ES module (see

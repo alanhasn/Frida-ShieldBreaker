@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-01
+
+### Added
+
+- **Automatic framework detection** (`agents/framework_detection/`): a
+  registry of per-framework detectors (Flutter, React Native, Unity,
+  Xamarin, Cordova, Capacitor, native Android) that each report a 0-100
+  confidence score and human-readable evidence from loaded native
+  modules, Java marker classes, and (for Flutter) a live Dart VM version
+  read. Detected frameworks map to the modules to auto-enable via a
+  plain, editable lookup table rather than logic embedded in the
+  detectors, so extending coverage or changing a mapping never touches
+  detection code. Emits structured diagnostics
+  (`framework_detection_started`/`_finished`, `framework_confidence`,
+  `framework_evidence`, `framework_detected`, `automatic_modules_selected`)
+  through the existing log/event pipeline. Runs once per process
+  (memoized) at the same bootstrap point every module's `init()` already
+  runs from.
+- **CLI**: `--auto` (alias `--detect`) on `run`. Enables automatic module
+  selection instead of the fixed default set; an explicit `--modules`
+  always takes precedence. `--bypass` now applies uniformly to whatever
+  gets enabled, whether from `--modules` or from automatic detection.
+
+### Changed
+
+- `agents/loader.js`'s `bootstrap()` selects its module list from
+  `framework_detection` when the init payload's `auto_detect` flag is
+  set; behavior when it's unset is unchanged. Per-module config is now
+  built as `{ bypass: defaultBypass, ...moduleConfig[name] }` uniformly,
+  replacing the previous Python-side per-module bypass population loop
+  (which couldn't have enumerated an auto-detected module list in
+  advance anyway). Existing `--modules`/`--bypass`/`--module-config`
+  combinations produce identical effective configs to before.
+
 ## [0.2.0] - 2026-07-31
 
 ### Added

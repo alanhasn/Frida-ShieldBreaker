@@ -49,6 +49,12 @@ policy.
   package layout) and installs native TLS hooks scoped to exactly that
   module, so its statically-linked BoringSSL is covered even when a
   separate system TLS library is also loaded in the same process.
+- **Automatic framework detection** (`--auto`) — identifies the target's
+  technology stack (Flutter, React Native, Unity, Xamarin, Cordova,
+  Capacitor, or native Android) from runtime evidence and enables only
+  the modules relevant to it, instead of requiring the user to already
+  know which ones apply. See
+  [Automatic Framework Detection](#automatic-framework-detection) below.
 
 ## Modules
 
@@ -62,6 +68,88 @@ policy.
 
 Each module's hooks are always safe to run in trace-only mode. Bypassing is
 gated per-module by `config.bypass` and is off by default.
+
+## Automatic Framework Detection
+
+Passing `--auto` (alias `--detect`) to `run` lets the agent identify the
+target's technology stack at runtime and enable only the modules relevant
+to it, instead of requiring `--modules` to be set correctly by hand. This
+runs entirely inside the injected agent (`agents/framework_detection/`),
+once, during the same bootstrap step that otherwise reads `--modules`
+directly — an explicit `--modules` always takes precedence over `--auto`.
+
+**How it works.** A registry of per-framework detectors
+(`agents/framework_detection/{flutter,react_native,unity,xamarin,cordova,capacitor,native_android}.js`)
+each inspect the running process for evidence of their framework:
+loaded native modules (e.g. `libflutter.so`, `libil2cpp.so`,
+`libmonodroid.so`), Java marker classes (e.g. `io.flutter.embedding.
+engine.FlutterEngine`, `com.unity3d.player.UnityPlayer`), and — for
+Flutter — a live Dart VM version read via `Dart_VersionString()`. Every
+detector runs and reports a result; nothing is decided from a single
+signal.
+
+**Confidence scoring.** Each detector's `detect()` returns
+`{ framework, confidence, evidence }`, where `confidence` is a 0-100
+score built from independently-weighted checks (see
+`agents/framework_detection/scoring.js`): each piece of evidence that's
+actually present contributes its weight, and `evidence` collects a
+human-readable string for each one so the score is always explainable,
+not just a number. A framework counts as "detected" once its score
+clears a fixed threshold (50). Weights are deliberately front-loaded
+onto each framework's single most distinctive marker class, so that
+marker alone is enough to cross the threshold — native-library evidence
+adds further confidence when available, but isn't required. This
+matters because of *when* detection runs: `core/loader.py` spawns a
+process suspended and injects the agent before resuming it specifically
+so hooks are installed before the app's own early checks fire (see
+`core/loader.py`'s `spawn()`), and at that point an Android app's own
+Java classes are typically already resolvable via its classloader, while
+its own native libraries (loaded via `System.loadLibrary()` during
+`Application`/`Activity` initialization) usually are not yet. Native
+evidence is most complete when attaching to an already-running process
+with `--attach` rather than spawning.
+
+**Evidence collection.** Detection emits structured events through the
+same `log`/`event` pipeline every module uses:
+`framework_detection_started`, `framework_confidence` and
+`framework_evidence` (per detector, regardless of score),
+`framework_detected` (only for detectors that cleared the threshold),
+`framework_detection_finished`, and `automatic_modules_selected`. All of
+these surface through the normal console/log output — no separate
+reporting mechanism.
+
+**Automatic module selection.** Which modules a detected framework
+enables is a plain lookup table (`FRAMEWORK_MODULE_MAP` in
+`agents/framework_detection/detector.js`), not logic embedded in the
+detectors:
+
+| Framework | Modules enabled |
+|---|---|
+| Flutter | `flutter_tls`, `tls`, `recon`, `fs` |
+| React Native | `tls`, `recon`, `fs` |
+| Unity | `tls`, `recon`, `antidebug` |
+| Xamarin | `tls`, `recon`, `fs` |
+| Cordova | `tls`, `recon`, `fs` |
+| Capacitor | `tls`, `recon`, `fs` |
+| Native Android | `tls`, `recon`, `fs`, `antidebug` |
+
+If more than one framework clears the threshold, their module lists are
+unioned. If none does, automatic selection falls back to the same
+`fs,tls,antidebug` set `run` uses with no flags at all — `--auto` never
+enables fewer modules than doing nothing would.
+
+**Adding a new framework detector** requires no changes to the detection
+engine itself:
+
+1. Create `agents/framework_detection/<name>.js` exporting `detect()`,
+   returning `{ framework, confidence, evidence }` (see any existing
+   detector for the pattern; `scoring.js`'s `scoreEvidence` builds the
+   score/evidence pair from a list of weighted checks).
+2. Import it in `detector.js` and add it to the `DETECTORS` array.
+3. Add its module mapping to `FRAMEWORK_MODULE_MAP`.
+4. If it's a distinct Android app type, add its most distinctive marker
+   class to `native_android.js`'s exclusion list, so "native Android"
+   stays an accurate negative signal.
 
 ## Requirements
 
@@ -118,6 +206,9 @@ python main.py run com.example.app --usb --spawn \
 python main.py run com.example.app --usb --spawn \
     --modules fs,tls,antidebug,flutter_tls --bypass
 
+# Let the agent detect the target's framework and pick modules itself
+python main.py run com.example.app --usb --spawn --auto --bypass
+
 # Persist structured logs to disk in addition to the console
 python main.py run com.example.app --usb --spawn --log-file reports/session.log
 
@@ -129,7 +220,9 @@ python main.py run com.example.app --usb --spawn \
 Run `python main.py run --help` for the full list of flags, including
 `--retry-spawn` (retries a spawn that times out on flaky USB/zygote
 gating — a known intermittent Frida issue, not a fixed-length timeout this
-project controls) and `--agent` (point at an alternate compiled bundle).
+project controls), `--agent` (point at an alternate compiled bundle), and
+`--auto`/`--detect` (see
+[Automatic Framework Detection](#automatic-framework-detection)).
 
 ## Project Structure
 
@@ -148,6 +241,7 @@ frida-shieldbreaker/
 │   ├── anti_debug/                #   Anti-debug diagnostics module
 │   ├── recon/                      #   Evidence-driven reconnaissance module
 │   ├── flutter_tls/                  #   Flutter-aware native TLS discovery & bypass module
+│   ├── framework_detection/           #   Automatic framework detection engine + per-framework detectors
 │   └── dist/                        #   Build output (frida-compile bundle, gitignored)
 ├── native/gum_extensions/    # Reserved for future native Gum extensions
 ├── config/                   # Reserved for user-supplied configuration profiles
