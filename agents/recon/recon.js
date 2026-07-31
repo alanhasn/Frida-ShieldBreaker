@@ -347,6 +347,27 @@ function describeClassShapeOnce(className) {
 }
 
 /**
+ * Finds the name of the first field, declared directly on `instance`'s
+ * class, whose declared type is `typeName` -- or null if none match.
+ * Used as a fallback when a known field name turns out not to be
+ * present: an obfuscated class that isn't actually the expected type
+ * may still carry an equivalent value under a different (often
+ * single-letter) name, and scanning by declared type finds it without
+ * having to guess or hardcode that name.
+ */
+function findFirstDeclaredFieldNameOfType(instance, typeName) {
+    try {
+        const fields = instance.getClass().getDeclaredFields();
+        for (const field of fields) {
+            if (field.getType().getName() === typeName) return field.getName();
+        }
+    } catch (e) {
+        // ignore -- caller treats null the same as "not found"
+    }
+    return null;
+}
+
+/**
  * Flutter's MethodChannel.MethodCallHandler.onMethodCall(MethodCall, Result)
  * is a semantically special shape: args[0] names which channel method was
  * actually invoked, args[1] is how the answer gets sent back to Dart.
@@ -391,11 +412,13 @@ function tryHookFlutterMethodCallHandler(Klass, className, methodName) {
             const callInfo = describeArg(call);
             const resultInfo = describeArg(result);
 
-            // "method" is Flutter's real field name on MethodCall. Some
-            // obfuscated builds expose an equivalent object under a
-            // different concrete type where the same value lands on a
-            // short, generated field name instead -- "a" is a common
-            // case in R8-minified output, so it's tried next. Read via
+            // "method" is Flutter's real field name on MethodCall. If the
+            // argument isn't actually Flutter's MethodCall (see this
+            // function's docstring), it won't have that field -- fall
+            // back to the first declared String-typed field instead of
+            // giving up, since an obfuscated equivalent of MethodCall
+            // still tends to carry the invoked method name as its one
+            // String member, whatever it happens to be named. Read via
             // reflection either way, not Frida's `.fieldName.value`
             // sugar: a class can have both a field and a method sharing
             // a name (common once an obfuscator has squashed everything
@@ -404,15 +427,17 @@ function tryHookFlutterMethodCallHandler(Klass, className, methodName) {
             // it produces `undefined` instead of throwing. Reflection's
             // Field/Method namespaces don't collide, so this can't
             // repeat that failure mode.
-            let invokedMethod = null;
-            let invokedMethodField = null;
-            for (const fieldName of ["method", "a"]) {
-                const value = readFieldViaReflection(call, fieldName);
-                if (value !== undefined) {
-                    invokedMethod = value;
-                    invokedMethodField = fieldName;
-                    break;
-                }
+            let invokedMethod = readFieldViaReflection(call, "method");
+            let invokedMethodField = "method";
+            if (invokedMethod === undefined) {
+                invokedMethodField = findFirstDeclaredFieldNameOfType(call, "java.lang.String");
+                invokedMethod = invokedMethodField !== null
+                    ? readFieldViaReflection(call, invokedMethodField)
+                    : undefined;
+            }
+            if (invokedMethod === undefined) {
+                invokedMethod = null;
+                invokedMethodField = null;
             }
 
             event(MODULE_NAME, "flutter_method_channel_call", {

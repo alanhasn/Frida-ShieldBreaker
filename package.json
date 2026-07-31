@@ -2,6 +2,7 @@
   "name": "frida-shieldbreaker-agents",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "GumJS instrumentation agents for Frida-ShieldBreaker, bundled with frida-compile into the single payload core/loader.py injects.",
   "type": "module",
   "scripts": {

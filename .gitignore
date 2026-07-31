@@ -7,3 +7,21 @@ reports/*.json
 node_modules/
 agents/dist/
 *.egg-info/
+
+# Session-local investigation output -- APKs, extracted DEX/decompiler
+# output, ad-hoc run logs. Never target-specific artifacts in the repo.
+*.log
+scratch/
+*.apk
+*.ipa
+*.dex
+
+# Environment/secrets
+.env
+.env.*
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
