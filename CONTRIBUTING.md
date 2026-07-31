@@ -82,6 +82,12 @@ and `npm run typecheck` to confirm the JS agent sources are well-formed.
   Prefer reflection/introspection-based fallbacks — see
   `agents/recon/recon.js` for the pattern used when a known field/class
   name may not be present on an obfuscated or unexpected target.
+- Don't re-implement a hook another module already has. If a new module
+  needs the same underlying technique applied to a different scope (e.g.
+  a specific native module rather than a process-wide search), export a
+  parameterized entry point from the module that owns the hook instead —
+  see `installNativeTlsHooksForModules` in `agents/tls_inspector/tls_inspector.js`
+  and its caller in `agents/flutter_tls/flutter_tls.js` for the pattern.
 
 ## Before submitting a pull request
 

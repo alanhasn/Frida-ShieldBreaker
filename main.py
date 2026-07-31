@@ -12,6 +12,8 @@ Example usage:
     python main.py run com.example.app --usb --spawn \\
         --modules fs,tls,antidebug --log-file reports/session.log
     python main.py run 1234 --attach --agent agents/dist/agent.js
+    python main.py run com.example.app --usb --spawn \\
+        --modules fs,tls,antidebug,flutter_tls --bypass
 """
 
 from __future__ import annotations
@@ -76,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--bypass", action="store_true",
         help="Actively bypass detected checks (spoof return values) instead of only tracing them. "
-             "Applies to every enabled module that supports it (fs, tls).",
+             "Applies to every enabled module that supports it (fs, tls, antidebug, flutter_tls).",
     )
     run_parser.add_argument(
         "--module-config", type=str, default=None, metavar="JSON",

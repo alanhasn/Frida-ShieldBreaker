@@ -44,6 +44,11 @@ policy.
   introspection, and reflects on unfamiliar object shapes instead of
   guessing field/method names — useful when a target's detection logic
   isn't covered by a known library or pattern.
+- **Flutter-aware TLS scoping** — the `flutter_tls` module identifies
+  Flutter's own native engine module at runtime (rather than assuming a
+  package layout) and installs native TLS hooks scoped to exactly that
+  module, so its statically-linked BoringSSL is covered even when a
+  separate system TLS library is also loaded in the same process.
 
 ## Modules
 
@@ -53,6 +58,7 @@ policy.
 | `tls_inspector` | `tls`       | Observes and optionally bypasses TLS certificate validation and pinning — Android`TrustManager`/OkHttp/WebView, iOS `SecTrust`/`NSURLSession`, and native OpenSSL/BoringSSL.                             |
 | `anti_debug`    | `antidebug` | Traces and optionally neutralizes`ptrace`-based and `/proc`-introspection anti-debugging checks, plus forced self-destruct calls (`exit`/`abort`/`raise`).                                            |
 | `recon`         | `recon`     | Diagnostic-only by default; not part of the default module set. Enumerates suspicious classes, hooks common "reaction points," and auto-traces unknown detection call chains with reflection-based diagnostics. |
+| `flutter_tls`   | `flutter_tls` | Not part of the default module set. Detects a Flutter runtime, locates its native engine module(s), identifies the bundled OpenSSL/BoringSSL, and installs TLS hooks scoped to those modules — a no-op on non-Flutter targets. |
 
 Each module's hooks are always safe to run in trace-only mode. Bypassing is
 gated per-module by `config.bypass` and is off by default.
@@ -108,6 +114,10 @@ python main.py run com.example.app --usb --attach
 python main.py run com.example.app --usb --spawn \
     --modules fs,tls,antidebug,recon
 
+# Against a Flutter target: identify and bypass its own bundled TLS stack
+python main.py run com.example.app --usb --spawn \
+    --modules fs,tls,antidebug,flutter_tls --bypass
+
 # Persist structured logs to disk in addition to the console
 python main.py run com.example.app --usb --spawn --log-file reports/session.log
 
@@ -137,6 +147,7 @@ frida-shieldbreaker/
 │   ├── tls_inspector/            #   TLS inspection & pinning bypass module
 │   ├── anti_debug/                #   Anti-debug diagnostics module
 │   ├── recon/                      #   Evidence-driven reconnaissance module
+│   ├── flutter_tls/                  #   Flutter-aware native TLS discovery & bypass module
 │   └── dist/                        #   Build output (frida-compile bundle, gitignored)
 ├── native/gum_extensions/    # Reserved for future native Gum extensions
 ├── config/                   # Reserved for user-supplied configuration profiles

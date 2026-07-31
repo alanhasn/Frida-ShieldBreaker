@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-31
+
+### Added
+
+- **`flutter_tls` module**: Flutter-aware TLS discovery and bypass, opt-in
+  (not part of the default module set). Detects a Flutter runtime via
+  Java embedding markers and native engine module discovery
+  (`libflutter.so`/`libapp.so`, or the iOS `Flutter`/`App` frameworks);
+  identifies the bundled OpenSSL/BoringSSL by probing for known export
+  names within those specific modules; reads the running Dart VM version
+  via `Dart_VersionString()`; and installs TLS hooks scoped to exactly
+  the discovered engine module(s) through an explicit, extensible
+  bypass-strategy registry. Cross-references Java-visible networking
+  (OkHttp/TrustManager) rather than duplicating those hooks. Entirely a
+  no-op on non-Flutter targets.
+- `agents/common/native_utils.js`: `findModules` (candidate-name module
+  lookup) and `readCString`, generic infrastructure used by the new
+  module and available to any future one.
+
+### Changed
+
+- `agents/tls_inspector/tls_inspector.js`: the native OpenSSL/BoringSSL
+  hooks can now be scoped to a specific list of module-name candidates
+  via the new `installNativeTlsHooksForModules` export, instead of only
+  the process-wide wildcard search. Existing behavior (`init()`) is
+  unchanged.
+
 ## [0.1.0] - 2026-07-31
 
 Initial public release.
