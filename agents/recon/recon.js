@@ -235,8 +235,115 @@ function safeStringify(value) {
 }
 
 // Every class this session has already installed a tracer on -- de-dupes
-// repeat calls against the same class.
+// repeat calls and stops the caller-auto-discovery cascade below from
+// re-hooking (or infinitely recursing into) the same class.
 const tracedClassNames = new Set();
+
+// Caller auto-discovery naturally self-limits once it reaches AOSP/
+// framework plumbing (Handler/Looper/etc., excluded via isFrameworkClass),
+// but this caps it regardless as a hard safety net against any
+// unexpectedly deep or noisy call chain.
+const MAX_AUTO_TRACE_DEPTH = 4;
+
+function parseClassNameFromStackFrame(frame) {
+    // e.g. "com.scottyab.rootbeer.RootBeerNative.checkForRoot(Native Method)"
+    // -> "com.scottyab.rootbeer.RootBeerNative"
+    const parenIdx = frame.indexOf("(");
+    const beforeParen = parenIdx >= 0 ? frame.slice(0, parenIdx) : frame;
+    const lastDot = beforeParen.lastIndexOf(".");
+    return lastDot >= 0 ? beforeParen.slice(0, lastDot) : beforeParen;
+}
+
+/** Finds whoever called `tracedClassName` by locating it in its own captured stack and taking the next frame up. */
+function findCallerClassName(stackFrames, tracedClassName) {
+    for (let i = 0; i < stackFrames.length - 1; i++) {
+        if (parseClassNameFromStackFrame(stackFrames[i]) === tracedClassName) {
+            return parseClassNameFromStackFrame(stackFrames[i + 1]);
+        }
+    }
+    return null;
+}
+
+const describedClassShapes = new Set();
+
+/**
+ * Reads a field's value via java.lang.reflect.Field rather than Frida's
+ * `.fieldName.value` convenience sugar. That sugar resolves a single JS
+ * property name against a class that may have *both* a field and a
+ * method sharing that name -- common once an obfuscator (e.g. R8) has
+ * squashed every member down to single letters -- and can silently
+ * resolve to the method wrapper (which has no `.value`, hence
+ * `undefined`) instead of the field. Reflection's Field/Method
+ * namespaces are separate, so this can't repeat that failure mode.
+ * Returns `undefined` (never throws) if the field doesn't exist, so
+ * callers can distinguish "not present" from a real value including
+ * Java `null`.
+ */
+function readFieldViaReflection(instance, fieldName) {
+    try {
+        const field = instance.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        const rawValue = field.get(instance);
+        if (rawValue === null || rawValue === undefined) return rawValue;
+
+        // Field.get() is declared to return Object, so Frida hands back a
+        // generic, untyped wrapper regardless of the field's real
+        // declared type -- its own toString() just prints a placeholder
+        // like "<instance: java.lang.Object, $className: ...>" instead
+        // of delegating to the real type's toString(). Re-casting to the
+        // field's actual declared type (read off the same Field object)
+        // makes Frida treat it correctly; for a String field this gets us
+        // the real text instead of that placeholder.
+        try {
+            const fieldTypeName = field.getType().getName();
+            const casted = Java.cast(rawValue, Java.use(fieldTypeName));
+            return fieldTypeName === "java.lang.String" ? casted.toString() : casted;
+        } catch (e) {
+            return rawValue; // best-effort -- return the untyped wrapper rather than fail
+        }
+    } catch (e) {
+        return undefined;
+    }
+}
+
+/**
+ * `value.getClass()` throwing is ambiguous by itself -- it means either
+ * "value is null/undefined" (expected, not evidence of anything) or
+ * "value is a real object but something else went wrong" (worth seeing),
+ * or "this was never a Java object wrapper at all" (e.g. `getClass is
+ * not a function`) -- e.g. a raw NativePointer, a JS primitive, or a
+ * callback Frida represented some other way. `jsType` disambiguates
+ * that last case directly instead of just recording that the accessor
+ * attempt failed.
+ */
+function describeArg(value) {
+    if (value === null || value === undefined) return { className: null, isNull: true, jsType: typeof value };
+    try {
+        return { className: value.getClass().getName(), isNull: false, jsType: typeof value };
+    } catch (e) {
+        return { className: `<error: ${e.message}>`, isNull: false, jsType: typeof value };
+    }
+}
+
+/**
+ * Reflection dump of a class's own declared fields + methods, reported
+ * once per class name -- for when a mystery object (like an argument
+ * that turned out not to be the Flutter type we assumed) needs its
+ * actual shape inspected directly instead of guessing accessor names.
+ */
+function describeClassShapeOnce(className) {
+    if (!className || describedClassShapes.has(className)) return;
+    describedClassShapes.add(className);
+    try {
+        const Klass = Java.use(className);
+        const fields = Klass.class.getDeclaredFields().map((f) => `${f.getType().getName()} ${f.getName()}`);
+        const methodNames = [...new Set(Klass.class.getDeclaredMethods().map((m) => m.getName()))];
+        event(MODULE_NAME, "unknown_class_shape", { class: className, fields, methods: methodNames });
+        log(MODULE_NAME, "info", `Described shape of ${className}: ${fields.length} field(s), ${methodNames.length} method(s)`);
+    } catch (e) {
+        log(MODULE_NAME, "debug", `Failed to describe class shape for ${className}: ${e.stack || e}`);
+    }
+}
 
 /**
  * Generic "trace (and, when bypass is enabled, neutralize) every method
@@ -245,9 +352,11 @@ const tracedClassNames = new Set();
  * but it's unclear which of its many methods the app actually calls.
  * Guessing individual method names one at a time doesn't scale for a
  * library with a dozen-plus leaf checks; this hooks everything the
- * class declares and logs every call with its real result and JS type.
+ * class declares, logs every call with its real result and JS type, and
+ * auto-discovers + recursively traces whoever called it, so the actual
+ * caller doesn't have to be hardcoded per app.
  */
-function traceAndNeutralizeClass(className) {
+function traceAndNeutralizeClass(className, depth = 0) {
     if (tracedClassNames.has(className)) return;
     tracedClassNames.add(className);
 
@@ -273,6 +382,7 @@ function traceAndNeutralizeClass(className) {
                 overload.implementation = function (...args) {
                     const result = this[methodName](...args);
                     const bypassed = bypassEnabled && Boolean(result);
+                    const callerStack = currentStackTrace(8);
                     event(MODULE_NAME, "library_method_trace", {
                         class: className,
                         method: methodName,
@@ -280,7 +390,16 @@ function traceAndNeutralizeClass(className) {
                         result: safeStringify(result),
                         result_type: typeof result,
                         bypassed,
+                        caller_stack: callerStack,
                     });
+
+                    if (depth < MAX_AUTO_TRACE_DEPTH) {
+                        const callerClass = findCallerClassName(callerStack, className);
+                        if (callerClass && !isFrameworkClass(callerClass) && !tracedClassNames.has(callerClass)) {
+                            log(MODULE_NAME, "info", `Auto-discovered caller of ${className}.${methodName}: ${callerClass} -- tracing it too`);
+                            traceAndNeutralizeClass(callerClass, depth + 1);
+                        }
+                    }
 
                     // Frida's Java bridge enforces that the returned value is
                     // compatible with the method's *declared* return type --
