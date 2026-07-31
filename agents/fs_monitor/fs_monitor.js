@@ -54,6 +54,41 @@ const DEFAULT_SUSPICIOUS_PATH_MARKERS = [
     "/usr/lib/frida",
 ];
 
+const ROOT_PROPERTY_KEYS = new Set([
+    "ro.build.tags",
+    "ro.build.type",
+    "ro.build.selinux",
+    "ro.debuggable",
+    "ro.secure",
+    "ro.boot.verifiedbootstate",
+    "ro.boot.flash.locked",
+    "ro.boot.veritymode",
+]);
+
+// Package identifiers RootBeer-style detectors query PackageManager for
+// directly (detectRootManagementApps() / detectPotentiallyDangerousApps()),
+// as opposed to checking the filesystem for su/magisk binaries.
+const ROOT_MANAGEMENT_PACKAGES = new Set([
+    "com.noshufou.android.su",
+    "com.noshufou.android.su.elite",
+    "eu.chainfire.supersu",
+    "com.koushikdutta.superuser",
+    "com.thirdparty.superuser",
+    "com.yellowes.su",
+    "com.topjohnwu.magisk",
+    "com.kingroot.kinguser",
+    "com.kingo.root",
+    "com.smedialink.oneclickroot",
+    "com.zhiqupk.root.global",
+    "com.alephzain.framaroot",
+    "com.koushikdutta.rommanager",
+    "com.koushikdutta.rommanager.license",
+    "com.dimonvideo.luckypatcher",
+    "com.chelpus.lackypatch",
+    "com.ramdroid.appquarantine",
+    "com.ramdroid.appquarantinepro",
+]);
+
 const SU_EXEC_MARKERS = ["su", "which su", "busybox", "magisk"];
 
 // Binaries commonly shelled out to for root/environment fingerprinting.
@@ -65,7 +100,7 @@ const SENSITIVE_EXEC_BINARIES = new Set(["getprop", "mount", "which", "id", "su"
 
 // Values a clean, non-rooted device would report for the keys apps most
 // commonly probe -- shared between the `getprop <key>` exec spoof below
-// and any direct property-read hook added later.
+// and the direct SystemProperties.get() spoof in hookBuildProperties().
 const SPOOFED_PROPERTY_VALUES = {
     "ro.build.tags": "release-keys",
     "ro.debuggable": "0",
@@ -240,6 +275,65 @@ function installReadlinkHooks() {
     }
 }
 
+/**
+ * Native equivalent of the Java SystemProperties.get() hook in
+ * hookBuildProperties() -- closes the gap where a plugin's native (JNI)
+ * code reads a property directly via __system_property_get(), bypassing
+ * the Java-level check entirely. Reuses the exact same ROOT_PROPERTY_KEYS/
+ * SPOOFED_PROPERTY_VALUES tables so both layers agree on what "clean"
+ * looks like.
+ */
+function hookNativePropertyGet() {
+    const resolved = resolveExport([[null, "__system_property_get"]]);
+    if (resolved === null) {
+        log(MODULE_NAME, "debug", "__system_property_get: no matching export found");
+        return;
+    }
+    attachSafe(MODULE_NAME, resolved.address, {
+        onEnter(args) {
+            this.name = readCString(args[0]);
+            this.valueBuf = args[1];
+        },
+        onLeave(retval) {
+            if (!this.name) return;
+            let value = null;
+            try {
+                value = this.valueBuf.readCString();
+            } catch (e) {
+                return;
+            }
+            const suspiciousValue = typeof value === "string" && value.toLowerCase().includes("test-keys");
+            if (!ROOT_PROPERTY_KEYS.has(this.name) && !suspiciousValue) return;
+
+            const spoofed = bypassEnabled && Object.prototype.hasOwnProperty.call(SPOOFED_PROPERTY_VALUES, this.name)
+                ? SPOOFED_PROPERTY_VALUES[this.name]
+                : null;
+            const bypassed = spoofed !== null;
+
+            event(MODULE_NAME, "suspicious_property_check", {
+                source: "native",
+                api: "__system_property_get",
+                key: this.name,
+                value,
+                bypassed,
+            });
+
+            if (bypassed) {
+                try {
+                    const bytes = [];
+                    for (let i = 0; i < spoofed.length; i++) bytes.push(spoofed.charCodeAt(i));
+                    bytes.push(0); // property values are NUL-terminated C strings
+                    this.valueBuf.writeByteArray(bytes);
+                    retval.replace(spoofed.length);
+                } catch (e) {
+                    log(MODULE_NAME, "debug", `Failed to spoof native property ${this.name}: ${e.stack || e}`);
+                }
+            }
+        },
+    });
+    log(MODULE_NAME, "debug", `Hooked __system_property_get -> ${resolved.moduleName}!${resolved.symbolName}`);
+}
+
 function installNativeHooks() {
     hookPathArgFn([[null, "open"]], "open", { classify: existsFromNonNegativeRetval, bypassRetval: bypassIntFailure });
     hookPathArgFn([[null, "openat"]], "openat", { pathArgIndex: 1, classify: existsFromNonNegativeRetval, bypassRetval: bypassIntFailure });
@@ -250,6 +344,7 @@ function installNativeHooks() {
     hookPathArgFn([[null, "lstat"], [null, "lstat64"]], "lstat", { classify: existsFromZeroRetval, bypassRetval: bypassIntFailure });
     hookPathArgFn([[null, "fstatat"], [null, "fstatat64"]], "fstatat", { pathArgIndex: 1, classify: existsFromZeroRetval, bypassRetval: bypassIntFailure });
     installReadlinkHooks();
+    hookNativePropertyGet();
 }
 
 // --------------------------------------------------------------------
@@ -390,10 +485,307 @@ function hookJavaRuntimeExec() {
     }
 }
 
+function hookBuildProperties() {
+    try {
+        const Build = Java.use("android.os.Build");
+        event(MODULE_NAME, "build_fingerprint", {
+            tags: Build.TAGS.value,
+            fingerprint: Build.FINGERPRINT.value,
+            type: Build.TYPE.value,
+            model: Build.MODEL.value,
+        });
+    } catch (e) {
+        log(MODULE_NAME, "error", `Failed to read android.os.Build fields: ${e.stack || e}`);
+    }
+
+    // Build.TAGS/FINGERPRINT are `static final` fields populated once from
+    // system properties at class-load time -- Frida can intercept method
+    // calls, not field reads, so there is no way to "hook" a read of
+    // Build.TAGS itself. SystemProperties.get() is the actual choke point:
+    // it's what populates those fields in the first place, and it's also
+    // what any app code calls directly to re-check ro.build.tags/ro.secure/
+    // ro.debuggable at runtime, bypassing android.os.Build entirely.
+    try {
+        const SystemProperties = Java.use("android.os.SystemProperties");
+
+        const reportGet = (key, value, bypassed = false) => {
+            const suspiciousValue = typeof value === "string" && value.toLowerCase().includes("test-keys");
+            if (ROOT_PROPERTY_KEYS.has(key) || suspiciousValue) {
+                event(MODULE_NAME, "suspicious_property_check", {
+                    source: "java",
+                    api: "SystemProperties.get",
+                    key,
+                    value,
+                    bypassed,
+                });
+            }
+        };
+
+        const spoofFor = (key) =>
+            Object.prototype.hasOwnProperty.call(SPOOFED_PROPERTY_VALUES, key) ? SPOOFED_PROPERTY_VALUES[key] : null;
+
+        SystemProperties.get.overload("java.lang.String").implementation = function (key) {
+            const spoofed = bypassEnabled ? spoofFor(key) : null;
+            if (spoofed !== null) {
+                reportGet(key, spoofed, true);
+                return spoofed;
+            }
+            const value = this.get(key);
+            reportGet(key, value);
+            return value;
+        };
+
+        SystemProperties.get.overload("java.lang.String", "java.lang.String").implementation = function (key, def) {
+            const spoofed = bypassEnabled ? spoofFor(key) : null;
+            if (spoofed !== null) {
+                reportGet(key, spoofed, true);
+                return spoofed;
+            }
+            const value = this.get(key, def);
+            reportGet(key, value);
+            return value;
+        };
+    } catch (e) {
+        log(MODULE_NAME, "error", `Failed to hook android.os.SystemProperties: ${e.stack || e}`);
+    }
+}
+
+// "Developer mode" is a distinct concept from root: Android exposes it
+// via Settings.Global/Secure ("development_settings_enabled",
+// "adb_enabled") and Debug.isDebuggerConnected(). Any device set up to
+// run this framework at all (frida-server, adb shell, USB debugging)
+// will genuinely have these on, and some apps treat that as its own
+// detection signal -- independent of, or in addition to, any root
+// check. Traced and spoofed here as its own path rather than folded
+// into the root-property checks above.
+const DEVELOPER_MODE_SETTINGS_KEYS = new Set(["development_settings_enabled", "adb_enabled"]);
+
+function hookDeveloperModeSettings() {
+    ["android.provider.Settings$Global", "android.provider.Settings$Secure"].forEach((className) => {
+        let SettingsClass;
+        try {
+            SettingsClass = Java.use(className);
+        } catch (e) {
+            return; // class not present on this API level -- fine, try the next one
+        }
+
+        try {
+            SettingsClass.getInt.overloads.forEach((overload) => {
+                overload.implementation = function (...args) {
+                    const key = args[1]; // (ContentResolver, String name[, int def])
+                    const suspicious = typeof key === "string" && DEVELOPER_MODE_SETTINGS_KEYS.has(key);
+                    try {
+                        const result = this.getInt(...args);
+                        const bypassed = bypassEnabled && suspicious && result !== 0;
+                        if (suspicious) {
+                            event(MODULE_NAME, "suspicious_setting_check", {
+                                source: "java", api: `${className}.getInt`, key, value: result, bypassed,
+                            });
+                        }
+                        return bypassed ? 0 : result;
+                    } catch (e) {
+                        // 2-arg overload throws Settings.SettingNotFoundException when
+                        // absent -- report it, then re-throw to preserve real behavior.
+                        // Nothing to bypass here: "not found" already reads as "off".
+                        if (suspicious) {
+                            event(MODULE_NAME, "suspicious_setting_check", {
+                                source: "java", api: `${className}.getInt`, key, error: String(e), bypassed: false,
+                            });
+                        }
+                        throw e;
+                    }
+                };
+            });
+        } catch (e) {
+            log(MODULE_NAME, "debug", `${className}.getInt not present: ${e.message}`);
+        }
+    });
+
+    try {
+        const Debug = Java.use("android.os.Debug");
+        Debug.isDebuggerConnected.implementation = function () {
+            const result = this.isDebuggerConnected();
+            event(MODULE_NAME, "suspicious_setting_check", {
+                source: "java", api: "Debug.isDebuggerConnected", value: result,
+            });
+            return result;
+        };
+    } catch (e) {
+        log(MODULE_NAME, "debug", `Debug.isDebuggerConnected not present: ${e.message}`);
+    }
+}
+
+/**
+ * RootBeer-style detectors don't only check the filesystem for su/magisk
+ * binaries -- detectRootManagementApps()/detectPotentiallyDangerousApps()
+ * query PackageManager directly, either per-package (getPackageInfo/
+ * getApplicationInfo, which throw NameNotFoundException when absent) or
+ * by scanning the full installed-app list. Both call sites are handled
+ * here so either style of check gets the same "not installed" answer.
+ */
+function hookPackageManagerRootAppChecks() {
+    try {
+        // getPackageInfo()/getApplicationInfo() are implemented on the
+        // concrete manager Context.getPackageManager() returns, not on the
+        // abstract PackageManager class itself.
+        const AppPackageManager = Java.use("android.app.ApplicationPackageManager");
+        const NameNotFoundException = Java.use("android.content.pm.PackageManager$NameNotFoundException");
+
+        ["getPackageInfo", "getApplicationInfo"].forEach((methodName) => {
+            try {
+                AppPackageManager[methodName].overloads.forEach((overload) => {
+                    overload.implementation = function (packageName, flags) {
+                        const suspicious = ROOT_MANAGEMENT_PACKAGES.has(packageName);
+                        const bypassed = bypassEnabled && suspicious;
+                        if (suspicious) {
+                            event(MODULE_NAME, "suspicious_package_check", {
+                                source: "java",
+                                api: `PackageManager.${methodName}`,
+                                package: packageName,
+                                bypassed,
+                            });
+                        }
+                        if (bypassed) {
+                            throw NameNotFoundException.$new(packageName);
+                        }
+                        return this[methodName](packageName, flags);
+                    };
+                });
+            } catch (e) {
+                log(MODULE_NAME, "debug", `PackageManager.${methodName} not present on this build`);
+            }
+        });
+
+        const filterInstalledList = (methodName, entryClassName) => {
+            try {
+                const EntryClass = Java.use(entryClassName);
+                AppPackageManager[methodName].overloads.forEach((overload) => {
+                    overload.implementation = function (flags) {
+                        const list = this[methodName](flags);
+                        if (!bypassEnabled) return list;
+
+                        const filtered = Java.use("java.util.ArrayList").$new();
+                        const it = list.iterator();
+                        let removedAny = false;
+                        while (it.hasNext()) {
+                            const rawEntry = it.next();
+                            const entry = Java.cast(rawEntry, EntryClass);
+                            if (ROOT_MANAGEMENT_PACKAGES.has(entry.packageName.value)) {
+                                removedAny = true;
+                                continue;
+                            }
+                            filtered.add(rawEntry);
+                        }
+                        if (removedAny) {
+                            event(MODULE_NAME, "suspicious_package_check", {
+                                source: "java",
+                                api: `PackageManager.${methodName}`,
+                                bypassed: true,
+                            });
+                        }
+                        return filtered;
+                    };
+                });
+            } catch (e) {
+                log(MODULE_NAME, "debug", `PackageManager.${methodName} not present on this build`);
+            }
+        };
+
+        filterInstalledList("getInstalledApplications", "android.content.pm.ApplicationInfo");
+        filterInstalledList("getInstalledPackages", "android.content.pm.PackageInfo");
+    } catch (e) {
+        log(MODULE_NAME, "error", `Failed to hook PackageManager root-app checks: ${e.stack || e}`);
+    }
+}
+
+/**
+ * RootBeer (scottyab/rootbeer) ships a `native` Java method specifically
+ * so a naive Java-only hooking script misses it -- but `.implementation =`
+ * intercepts at the ART method-dispatch level regardless of whether the
+ * body is Java bytecode or a JNI trampoline into a bundled .so, so this
+ * still catches it before the native code ever runs.
+ */
+function hookRootBeerNative() {
+    let RootBeerNative;
+    try {
+        RootBeerNative = Java.use("com.scottyab.rootbeer.RootBeerNative");
+    } catch (e) {
+        return; // library not present in this app -- nothing to do
+    }
+
+    try {
+        RootBeerNative.checkForRoot.implementation = function (cLibraryPaths) {
+            const realResult = this.checkForRoot(cLibraryPaths);
+            const bypassed = bypassEnabled && Boolean(realResult);
+            event(MODULE_NAME, "suspicious_native_check", {
+                source: "java-jni",
+                api: "RootBeerNative.checkForRoot",
+                result: realResult,
+                bypassed,
+            });
+            // Declared `native int checkForRoot(...)`, not `boolean` --
+            // returning the JS boolean `false` here throws "expected return
+            // value compatible with int" (confirmed by an actual crash
+            // hitting this exact path). 0 is RootBeer's own "not rooted".
+            return bypassed ? 0 : realResult;
+        };
+        log(MODULE_NAME, "debug", "Hooked com.scottyab.rootbeer.RootBeerNative.checkForRoot");
+    } catch (e) {
+        // Signature may differ across RootBeer forks/versions -- log the
+        // class's actual declared methods so the real one can be targeted.
+        try {
+            const methodNames = RootBeerNative.class.getDeclaredMethods().map((m) => m.getName());
+            log(MODULE_NAME, "warning", `RootBeerNative present but checkForRoot() hook failed; declared methods: ${methodNames.join(", ")}`);
+        } catch (e2) {
+            log(MODULE_NAME, "error", `Failed to hook RootBeerNative: ${e.stack || e}`);
+        }
+    }
+}
+
+/**
+ * Defense in depth: hook RootBeer's own top-level public API too, not
+ * just its individual leaf checks. RootBeer's checklist includes things
+ * this module doesn't separately replicate (e.g. checking whether
+ * /system is mounted read-write) -- catching the aggregate result covers
+ * those without needing to chase every leaf check one at a time.
+ */
+function hookRootBeerAggregate() {
+    let RootBeer;
+    try {
+        RootBeer = Java.use("com.scottyab.rootbeer.RootBeer");
+    } catch (e) {
+        return;
+    }
+
+    ["isRooted", "isRootedWithoutBusyBoxCheck"].forEach((methodName) => {
+        try {
+            RootBeer[methodName].implementation = function () {
+                const realResult = this[methodName]();
+                const bypassed = bypassEnabled && realResult;
+                event(MODULE_NAME, "suspicious_native_check", {
+                    source: "java",
+                    api: `RootBeer.${methodName}`,
+                    result: realResult,
+                    bypassed,
+                });
+                return bypassed ? false : realResult;
+            };
+            log(MODULE_NAME, "debug", `Hooked com.scottyab.rootbeer.RootBeer.${methodName}`);
+        } catch (e) {
+            log(MODULE_NAME, "debug", `RootBeer.${methodName} not present: ${e.message}`);
+        }
+    });
+}
+
 function installAndroidJavaHooks() {
     Java.perform(() => {
         hookJavaFileChecks();
         hookJavaRuntimeExec();
+        hookBuildProperties();
+        hookDeveloperModeSettings();
+        hookPackageManagerRootAppChecks();
+        hookRootBeerNative();
+        hookRootBeerAggregate();
     });
 }
 
