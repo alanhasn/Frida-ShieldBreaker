@@ -68,8 +68,8 @@ gated per-module by `config.bypass` and is off by default.
 ## Installation
 
 ```bash
-git clone <this-repository>
-cd frida-shieldbreaker
+git clone https://github.com/alanhasn/Frida-ShieldBreaker
+cd Frida-ShieldBreaker
 
 # Python side
 python -m venv venv
