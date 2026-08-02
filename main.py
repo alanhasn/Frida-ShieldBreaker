@@ -15,6 +15,8 @@ Example usage:
     python main.py run com.example.app --usb --spawn \\
         --modules fs,tls,antidebug,flutter_tls --bypass
     python main.py run com.example.app --usb --spawn --auto --bypass
+    python main.py run com.example.app --usb --spawn --auto --bypass \\
+        --report reports/session --report-format json,html,docx
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -30,11 +33,21 @@ from rich.table import Table
 
 from core.loader import AttachedTarget, FridaLoader, LoaderConfig, LoaderError, SpawnTimeoutError
 from core.logger import console, get_logger, setup_logging
+from core.report import ReportCollector, SUPPORTED_FORMATS, SessionMeta, write_reports
 
 DEFAULT_AGENT_PATH = Path("agents/dist/agent.js")
 DEFAULT_MODULES = "fs,tls,antidebug"
 
 logger = get_logger("cli")
+
+
+def _read_tool_version() -> str:
+    """Best-effort read of package.json's version -- one project version shared across the Python/JS split."""
+    try:
+        with open("package.json", encoding="utf-8") as f:
+            return str(json.load(f).get("version", "unknown"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return "unknown"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,6 +114,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Retry up to N times if spawning times out -- this is a known intermittent frida-core/"
              "zygote spawn-gating issue on some devices (frida/frida-core#376), not a fixed-length "
              "client-side timeout we can extend. Default: 1 (no retry).",
+    )
+    run_parser.add_argument(
+        "--report", type=Path, default=None, metavar="PATH",
+        help="Generate a session report at PATH after the session ends (the appropriate extension is "
+             "added per format, e.g. PATH.json/.html/.docx). Formats controlled by --report-format.",
+    )
+    run_parser.add_argument(
+        "--report-format", type=str, default=",".join(SUPPORTED_FORMATS), metavar="FORMATS",
+        help=f"Comma-separated report formats to generate when --report is set "
+             f"(default: all -- {', '.join(SUPPORTED_FORMATS)}).",
     )
 
     return parser
@@ -188,7 +211,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         modules_str = args.modules if explicit_modules else DEFAULT_MODULES
         init_payload["enabled_modules"] = [m.strip() for m in modules_str.split(",") if m.strip()]
 
+    report_collector: Optional[ReportCollector] = None
+    session_meta: Optional[SessionMeta] = None
+
     with FridaLoader(config) as loader:
+        if args.report:
+            report_collector = ReportCollector()
+            report_collector.attach(loader.ipc)
+
         target: AttachedTarget
         if args.spawn:
             for attempt in range(1, args.retry_spawn + 1):
@@ -203,6 +233,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             target_ref = int(args.target) if args.target.isdigit() else args.target
             target = loader.attach(target_ref)
 
+        if args.report:
+            session_meta = SessionMeta(
+                target=target.identifier,
+                device_name=loader.device.name,
+                started_at=datetime.now(timezone.utc),
+                modules_requested=list(init_payload.get("enabled_modules", [])),
+                auto_detect=auto_detect,
+                bypass_requested=bool(args.bypass),
+                agent_path=str(args.agent),
+                tool_version=_read_tool_version(),
+            )
+
         loader.load_agent(target, args.agent, init_payload=init_payload)
 
         if args.spawn and not args.no_resume:
@@ -210,6 +252,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         loader.wait_forever()
         loader.detach(target, kill=args.kill_on_exit and target.spawned_by_us)
+
+    if args.report and report_collector is not None and session_meta is not None:
+        session_meta.ended_at = datetime.now(timezone.utc)
+        try:
+            report = report_collector.build_report(session_meta)
+            formats = [f.strip() for f in args.report_format.split(",") if f.strip()]
+            for path in write_reports(report, args.report, formats=formats):
+                logger.info("Report written: %s", path)
+        except Exception:
+            logger.exception("Failed to generate report(s); session data itself was not affected")
 
     return 0
 
