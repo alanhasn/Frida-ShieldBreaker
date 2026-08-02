@@ -76,7 +76,12 @@ function bootstrap(initPayload) {
         }
     }
 
-    rpc.ready(MODULE_NAME, { enabled_modules: initialized, auto_detect: Boolean(payload.auto_detect) });
+    rpc.ready(MODULE_NAME, {
+        enabled_modules: initialized,
+        auto_detect: Boolean(payload.auto_detect),
+        platform: platformInfo.platform,
+        arch: platformInfo.arch,
+    });
 }
 
 rpc.once("init", bootstrap);
