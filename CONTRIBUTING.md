@@ -93,6 +93,28 @@ but a well-behaved detector degrades to `confidence: 0` on its own) and
 must never install a hook — detection is evidence-only; the modules it
 selects are what actually instrument anything.
 
+## Adding a new report interpreter
+
+`core/report/` (see the
+[README's Session Reports section](README.md#session-reports)) turns
+every module's `event` messages into JSON/HTML/DOCX reports. A new event
+name works in a report with no changes at all (it falls back to a
+generic description), but reads much better with its own interpreter:
+
+1. In `core/report/interpreters.py`, write a `_describe_<event_name>(payload)`
+   function returning `(title, description, severity)`. Use the actual
+   field names that event's `event(MODULE_NAME, "name", {...})` call in
+   the agent sends — check the JS source, don't guess the shape.
+2. Add `"event_name": (category, _describe_<event_name>)` to
+   `INTERPRETERS`. Reuse an existing category from `CATEGORY_TITLES` in
+   `core/report/model.py` if the new event fits one; only add a new
+   category for something genuinely distinct.
+3. Severity is one of `"high"` (a real bypass, or comparably significant),
+   `"medium"` (observed or an automatic action), `"low"` (a minor
+   diagnostic gap), or `"info"` (purely descriptive).
+
+Nothing else (the collector, the renderers) needs to change.
+
 ## Coding conventions
 
 - JavaScript agent code targets `es2022` as an ES module (see
@@ -124,7 +146,7 @@ selects are what actually instrument anything.
 ```bash
 npm run typecheck
 npm run build
-python -m py_compile main.py core/*.py
+python -m py_compile main.py core/*.py core/report/*.py
 ```
 
 All three should complete without errors. If you changed CLI flags or

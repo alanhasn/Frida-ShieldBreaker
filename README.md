@@ -55,6 +55,10 @@ policy.
   the modules relevant to it, instead of requiring the user to already
   know which ones apply. See
   [Automatic Framework Detection](#automatic-framework-detection) below.
+- **Session reports** (`--report`) — every finding collected during a run
+  can be turned into a JSON, HTML, or DOCX report: categorized, scored by
+  severity, and summarized, from the same event stream every module
+  already emits. See [Session Reports](#session-reports) below.
 
 ## Modules
 
@@ -151,6 +155,62 @@ engine itself:
    class to `native_android.js`'s exclusion list, so "native Android"
    stays an accurate negative signal.
 
+## Session Reports
+
+Passing `--report PATH` to `run` generates a report once the session
+ends, from the exact same `log`/`event`/`ready` messages every module
+already sends over IPC — no module needs to change to be included, and
+generating a report costs nothing when `--report` isn't given (no
+collector is attached, no report code runs at all).
+
+**How it works.** `core/report/collector.py`'s `ReportCollector`
+registers itself as additional handlers on the session's `IPCBus`
+(`IPCBus.on()` already supports multiple handlers per message type, so
+this needed no changes to `core/ipc.py`) and accumulates every `event`
+message as a `Finding`, in true emission order. Once the session ends,
+each `Finding` is run through `core/report/interpreters.py`'s registry
+and turned into an `InterpretedFinding` — a human-readable title,
+description, category, and severity, built from that specific event
+type's actual payload — before being handed to whichever renderer(s)
+were requested.
+
+**Categories and severity.** Findings are grouped into a fixed set of
+categories (Root/Jailbreak Detection, Developer Mode Detection, Process
+Execution, Device Fingerprinting, TLS/Pinning, Anti-Debugging, Runtime
+Reconnaissance, Flutter TLS, Framework Detection, and a catch-all
+"Other" for any event without a registered interpreter — nothing is ever
+silently dropped) and one of four severities: **high** (a real
+protection was bypassed, or a reaction-point/hook-installed finding of
+similar significance), **medium** (observed but not bypassed, or an
+automatic action such as module selection), **low** (a minor diagnostic
+gap, e.g. a hook that couldn't be installed), or **info** (purely
+descriptive, no action implied).
+
+**Formats.**
+
+| Format | Use case |
+|---|---|
+| `json` | Machine-readable: full session metadata, summary statistics, and every finding with both its interpreted fields and raw payload. For post-processing or feeding into other tooling. |
+| `html` | Self-contained, single-file document (inline CSS, no external requests) for opening directly in a browser: executive summary, session details, a findings-per-category overview, and detailed per-category findings tables. |
+| `docx` | The same content as the HTML report, as a Word document, for engagement writeups/deliverables that need one. Requires `python-docx` (in `requirements.txt`). |
+
+```bash
+python main.py run com.example.app --usb --spawn --auto --bypass \
+    --report reports/session --report-format json,html,docx
+```
+
+produces `reports/session.json`, `reports/session.html`, and
+`reports/session.docx`. `--report-format` defaults to all three; pass a
+subset (e.g. `--report-format html`) to skip the others.
+
+**Adding a new event type to reports** requires no changes to the report
+engine itself: add one `"event_name": (category, describe_fn)` entry to
+`INTERPRETERS` in `core/report/interpreters.py`, where `describe_fn(payload)`
+returns `(title, description, severity)`. An event with no registered
+interpreter still produces a usable (if less nicely worded) finding via
+a generic fallback, so this is a quality improvement, not a requirement,
+whenever a new module or event type is added.
+
 ## Requirements
 
 - Python 3.10+
@@ -209,6 +269,10 @@ python main.py run com.example.app --usb --spawn \
 # Let the agent detect the target's framework and pick modules itself
 python main.py run com.example.app --usb --spawn --auto --bypass
 
+# Generate JSON/HTML/DOCX session reports alongside the console output
+python main.py run com.example.app --usb --spawn --auto --bypass \
+    --report reports/session
+
 # Persist structured logs to disk in addition to the console
 python main.py run com.example.app --usb --spawn --log-file reports/session.log
 
@@ -220,9 +284,10 @@ python main.py run com.example.app --usb --spawn \
 Run `python main.py run --help` for the full list of flags, including
 `--retry-spawn` (retries a spawn that times out on flaky USB/zygote
 gating — a known intermittent Frida issue, not a fixed-length timeout this
-project controls), `--agent` (point at an alternate compiled bundle), and
+project controls), `--agent` (point at an alternate compiled bundle),
 `--auto`/`--detect` (see
-[Automatic Framework Detection](#automatic-framework-detection)).
+[Automatic Framework Detection](#automatic-framework-detection)), and
+`--report`/`--report-format` (see [Session Reports](#session-reports)).
 
 ## Project Structure
 
@@ -232,7 +297,8 @@ frida-shieldbreaker/
 ├── core/                    # Python orchestration engine
 │   ├── loader.py            #   FridaLoader: device/session/process lifecycle
 │   ├── ipc.py                #   Decodes agent messages, dispatches by type
-│   └── logger.py             #   Rich-backed console + optional file logging
+│   ├── logger.py              #   Rich-backed console + optional file logging
+│   └── report/                 #   Session report collection + JSON/HTML/DOCX rendering
 ├── agents/                   # JavaScript instrumentation agents (GumJS)
 │   ├── loader.js              #   Agent entry point; module registry + bootstrap
 │   ├── common/                 #   Shared RPC envelope + native/platform helpers

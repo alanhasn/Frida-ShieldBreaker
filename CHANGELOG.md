@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-02
+
+### Added
+
+- **Session reports** (`core/report/`): `--report PATH` on `run` generates
+  a JSON, HTML, and/or DOCX report (`--report-format`, default all three)
+  from the same `log`/`event`/`ready` IPC stream every module already
+  emits -- no module changes required. A collector accumulates every
+  event as a `Finding`; an interpreter registry
+  (`core/report/interpreters.py`) turns each into a human-readable
+  title/description/category/severity, covering every event type
+  currently emitted across fs_monitor, tls_inspector, anti_debug, recon,
+  flutter_tls, and framework_detection, with a generic fallback for
+  anything unregistered. Reports include an executive summary, session
+  details, a findings-per-category breakdown, and detailed per-category
+  findings tables. Adding report support for a new event type is a
+  one-entry addition to the interpreter registry; no other code changes.
+- `python-docx` dependency for the DOCX renderer (imported lazily, so
+  JSON/HTML report generation never requires it).
+- Agent `ready` payload now includes `platform`/`arch` (previously only
+  in a free-text log line), used to populate report session metadata.
+
+No behavior change when `--report` isn't passed: no collector is
+attached and no report code runs.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added
