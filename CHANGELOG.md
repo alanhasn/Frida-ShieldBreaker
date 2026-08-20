@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-02
+
+### Added
+
+- **`stalker_tracer` module**: native instruction tracing via Frida's
+  Stalker, with the hot path (agents/stalker_tracer/native_source.js)
+  compiled at runtime through CModule directly into the target process
+  for zero-JS-overhead per-instruction callouts, falling back to a
+  pure-JS callout automatically if CModule compilation is unavailable.
+  Traces a specific OS thread's actual execution path -- code with no
+  exported symbol to hook (OLLVM/flattened control flow, inlined
+  routines, raw `svc` syscalls) is now reachable. Module-name-based
+  range filtering plus `Stalker.exclude()` on every other loaded module
+  keeps instrumentation scoped and the target responsive. Instruction
+  filtering presets: `all`, `syscalls` (`svc`), `calls` (branch/call
+  mnemonics), or an explicit mnemonic list.
+- **RPC-driven interactive control**: unlike every other module,
+  `stalker_tracer` does nothing from `init()` on its own -- it's driven
+  live via Frida's own `rpc.exports` (`stalkerStart`/`Stop`/`Status`/
+  `Drain`/`ListThreads`/`Capabilities`). `config.auto_start` (via
+  `--module-config`) covers non-interactive/scripted use.
+- **CLI**: `-i`/`--interactive` on `run` -- replaces the usual silent
+  block-until-Ctrl+C with a small stdin REPL (`stalker start/stop/
+  status/drain/threads`) calling `target.script.exports_sync` live.
+- **Reports**: a new "Native Instruction Tracing" category and
+  interpreters for all six `stalker_tracer` event types.
+
+No behavior change when `stalker_tracer` isn't in `--modules` and
+`--interactive` isn't passed.
+
 ## [0.4.0] - 2026-08-02
 
 ### Added

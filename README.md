@@ -59,6 +59,13 @@ policy.
   can be turned into a JSON, HTML, or DOCX report: categorized, scored by
   severity, and summarized, from the same event stream every module
   already emits. See [Session Reports](#session-reports) below.
+- **Native instruction tracing** (`stalker_tracer`) — Stalker-based,
+  CModule-accelerated tracing of a specific thread's actual code path,
+  for code with no symbol to hook: OLLVM/flattened control flow, inlined
+  routines, raw syscalls. Controlled live via RPC (`--interactive`)
+  rather than a fixed "trace everything from boot" mode. See
+  [Native Instruction Tracer](#native-instruction-tracer-stalker--cmodule)
+  below.
 
 ## Modules
 
@@ -69,6 +76,7 @@ policy.
 | `anti_debug`    | `antidebug` | Traces and optionally neutralizes`ptrace`-based and `/proc`-introspection anti-debugging checks, plus forced self-destruct calls (`exit`/`abort`/`raise`).                                            |
 | `recon`         | `recon`     | Diagnostic-only by default; not part of the default module set. Enumerates suspicious classes, hooks common "reaction points," and auto-traces unknown detection call chains with reflection-based diagnostics. |
 | `flutter_tls`   | `flutter_tls` | Not part of the default module set. Detects a Flutter runtime, locates its native engine module(s), identifies the bundled OpenSSL/BoringSSL, and installs TLS hooks scoped to those modules — a no-op on non-Flutter targets. |
+| `stalker_tracer` | `stalker_tracer` | Not part of the default module set, and not enabled by `--auto`. Installs no hooks on its own; exposes RPC exports to start/stop/inspect a native (CModule) or JS-fallback Stalker trace against a specific thread. Driven via `--interactive`. |
 
 Each module's hooks are always safe to run in trace-only mode. Bypassing is
 gated per-module by `config.bypass` and is off by default.
@@ -211,6 +219,125 @@ interpreter still produces a usable (if less nicely worded) finding via
 a generic fallback, so this is a quality improvement, not a requirement,
 whenever a new module or event type is added.
 
+## Native Instruction Tracer (Stalker + CModule)
+
+Every other module hooks a *known address* (`Interceptor.attach`/`replace`
+on an exported symbol) — precise and cheap, but blind to code with no
+symbol: OLLVM-flattened control flow, an inlined routine, or a raw
+`svc #0` syscall buried inside a larger function. `stalker_tracer` covers
+that gap using Frida's **Stalker**, which follows a specific thread's
+actual execution path and recompiles each basic block into an
+instrumented copy as it runs — it needs a thread, not a symbol.
+
+**Why CModule.** Calling back into JavaScript on every traced
+instruction would visibly stall the target. The hot path — what runs on
+every instruction *execution* — is instead a small C function
+(`agents/stalker_tracer/native_source.js`) compiled at runtime by
+Frida's `CModule` directly into the target process, and handed to
+Stalker as a raw native pointer. Stalker calls it with zero JS/V8
+involvement per hit; it does the minimum possible (write a sequence
+number and the program counter into a fixed-size ring buffer) and
+nothing else. JavaScript only runs at block *compile* time (deciding
+whether a given instruction is worth instrumenting — see
+`buildInstructionFilter()`) and when a caller explicitly drains the
+buffer — both comparatively rare next to execution count. If CModule
+compilation fails for any reason (unsupported toolchain, etc.), the
+module transparently falls back to a slower pure-JS callout with an
+equivalent buffer — tracing still works, just without the zero-latency
+guarantee.
+
+**Scope and filtering.** `stalker start` resolves each requested module
+name to its loaded address range via `Process.findModuleByName()`, then
+calls `Stalker.exclude()` on *every other* loaded module — this, not
+just filtering which events get reported, is the real lever against
+freezing the app: Stalker must recompile every block that executes on a
+followed thread unless its containing range is excluded, so on a
+narrow target this is the difference between instrumenting one native
+library and re-instrumenting the entire Android runtime underneath it.
+Within the target range, an instruction filter decides whether to attach
+the native callout at all: `all` (default), `syscalls` (matches `svc`),
+`calls` (branch/call mnemonics, useful for mapping control flow through
+a flattened dispatcher), or an explicit array of mnemonics.
+
+**RPC control.** Unlike every other module, `stalker_tracer` does
+nothing on its own from `init()` — a real trace session needs to target
+an already-running thread on demand, not a fixed "trace everything from
+boot" mode. It's driven via Frida's own `rpc.exports`
+(`stalkerStart`/`Stop`/`Status`/`Drain`/`ListThreads`/`Capabilities`),
+which `main.py`'s `--interactive` shell wraps in a small `stalker ...`
+command grammar. A `config.auto_start` escape hatch (via
+`--module-config`) covers non-interactive/scripted use. Never enabled by
+`--auto` — this has real performance cost even filtered, and no
+passive-observe mode, so it stays opt-in only.
+
+**Reports.** Its events (`stalker_engine_ready`, `cmodule_compiled`/
+`_compile_failed`, `trace_started`/`_stopped`, `trace_summary`) flow
+through the same pipeline as every other module and appear in
+`--report` output under the "Native Instruction Tracing" category.
+
+### Testing and verification
+
+```bash
+npm run typecheck && npm run build   # confirm the module compiles into the bundle
+```
+
+Live verification needs a device with `frida-server` running and a
+target already launched (attach, not spawn — module-scoped filtering
+needs the target's own native libraries already loaded, which for spawn
+mode happens only after `resume()`, same timing constraint documented
+in [Automatic Framework Detection](#automatic-framework-detection)):
+
+```bash
+python main.py run com.example.app --usb --attach \
+    --modules stalker_tracer --interactive
+```
+
+Inside the shell:
+
+```
+shieldbreaker> stalker threads
+[{'id': 12345, 'state': 'waiting'}, {'id': 12346, 'state': 'running'}, ...]
+
+shieldbreaker> stalker start --thread 12346 --modules libnative-lib.so --filter syscalls
+{'started': True, 'threadId': 12346, 'native': True, 'excludedModuleCount': 87}
+
+# ... interact with the app to generate activity on that thread ...
+
+shieldbreaker> stalker drain 12346 200
+{'threadId': 12346, 'total': 1543, 'dropped': 0, 'sampled': 200, 'topAddresses': [...]}
+
+shieldbreaker> stalker stop 12346
+{'stopped': True, 'threadId': 12346, 'totalHits': 1543, 'durationMs': 8213}
+
+shieldbreaker> quit
+```
+
+`excludedModuleCount` confirms range scoping actually engaged; `native:
+True` confirms CModule compiled (check `stalker status` any time to see
+`cModuleAvailable`/`cModuleUnavailableReason` explicitly). If you don't
+know the target library's name in advance, start without `--modules`
+once (unscoped -- expect it to be noticeably slower) purely to confirm
+tracing fires at all, then narrow down.
+
+For scripted/non-interactive use, combine `config.auto_start` with
+`--report` to capture a trace automatically and get it in the same
+JSON/HTML/DOCX output as every other finding:
+
+```bash
+python main.py run com.example.app --usb --attach \
+    --modules stalker_tracer \
+    --module-config '{"stalker_tracer": {"auto_start": true, "thread_id": 12346, "modules": ["libnative-lib.so"], "filter": "syscalls"}}' \
+    --report reports/trace_session
+```
+
+**Known limitations.** CModule's compiler toolchain and exact Stalker
+callout behavior are device/Frida-version-dependent in ways that can't
+be verified without a live target -- if `stalker status` reports
+`cModuleAvailable: false`, tracing still works via the JS fallback, just
+slower; check `cModuleUnavailableReason` for why. `stalker start`
+requires a real, currently-valid OS thread id (`stalker threads` first)
+-- there is no meaningful "default thread."
+
 ## Requirements
 
 - Python 3.10+
@@ -273,6 +400,10 @@ python main.py run com.example.app --usb --spawn --auto --bypass
 python main.py run com.example.app --usb --spawn --auto --bypass \
     --report reports/session
 
+# Interactively drive a native (Stalker + CModule) instruction trace
+python main.py run com.example.app --usb --attach \
+    --modules stalker_tracer --interactive
+
 # Persist structured logs to disk in addition to the console
 python main.py run com.example.app --usb --spawn --log-file reports/session.log
 
@@ -286,8 +417,10 @@ Run `python main.py run --help` for the full list of flags, including
 gating — a known intermittent Frida issue, not a fixed-length timeout this
 project controls), `--agent` (point at an alternate compiled bundle),
 `--auto`/`--detect` (see
-[Automatic Framework Detection](#automatic-framework-detection)), and
-`--report`/`--report-format` (see [Session Reports](#session-reports)).
+[Automatic Framework Detection](#automatic-framework-detection)),
+`--report`/`--report-format` (see [Session Reports](#session-reports)),
+and `-i`/`--interactive` (see
+[Native Instruction Tracer](#native-instruction-tracer-stalker--cmodule)).
 
 ## Project Structure
 
@@ -308,6 +441,7 @@ frida-shieldbreaker/
 │   ├── recon/                      #   Evidence-driven reconnaissance module
 │   ├── flutter_tls/                  #   Flutter-aware native TLS discovery & bypass module
 │   ├── framework_detection/           #   Automatic framework detection engine + per-framework detectors
+│   ├── stalker_tracer/                 #   Stalker + CModule native instruction tracer, RPC-controlled
 │   └── dist/                        #   Build output (frida-compile bundle, gitignored)
 ├── native/gum_extensions/    # Reserved for future native Gum extensions
 ├── config/                   # Reserved for user-supplied configuration profiles

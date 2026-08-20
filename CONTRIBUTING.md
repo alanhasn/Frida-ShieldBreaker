@@ -62,6 +62,13 @@ and `npm run typecheck` to confirm the JS agent sources are well-formed.
 5. Gate any bypass behavior behind `config.bypass`, defaulting to `false`.
 6. Add a toggle for the module in `main.py`'s `--modules` help text and this
    repository's `README.md` module table.
+7. If the module needs to be driven interactively during a live session
+   rather than just configured once at `init()` (see `stalker_tracer` for
+   the pattern), expose Frida's own global `rpc.exports` -- **not**
+   `agents/common/rpc.js`'s `rpc` helper, which only ever exports
+   `log`/`event`/`ready`/`on`/`once`; import that as
+   `{ log, event }` specifically to avoid shadowing the global. Extend
+   `main.py`'s `--interactive` shell grammar to reach it from Python.
 
 ## Adding a new framework detector
 
