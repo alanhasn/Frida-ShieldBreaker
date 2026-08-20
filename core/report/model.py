@@ -33,6 +33,7 @@ CATEGORY_TITLES: dict[str, str] = {
     "reconnaissance": "Runtime Reconnaissance",
     "flutter_tls": "Flutter TLS Instrumentation",
     "framework_detection": "Framework Detection",
+    "native_tracing": "Native Instruction Tracing (Stalker)",
     "other": "Other",
 }
 

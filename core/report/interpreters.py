@@ -264,6 +264,62 @@ def _describe_library_method_trace(p: dict[str, Any]) -> tuple[str, str, str]:
 
 
 # --------------------------------------------------------------------
+# stalker_tracer
+# --------------------------------------------------------------------
+
+
+def _describe_stalker_engine_ready(p: dict[str, Any]) -> tuple[str, str, str]:
+    title = "Native instruction tracer ready"
+    description = f"stalker_tracer initialized on {p.get('platform')}/{p.get('arch')}; awaiting an RPC-driven or auto_start trace session."
+    return title, description, "info"
+
+
+def _describe_cmodule_compiled(_: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        "Native trace hot path compiled",
+        "CModule compiled the Stalker callout to native code -- traced hits run with no JavaScript involvement.",
+        "info",
+    )
+
+
+def _describe_cmodule_compile_failed(p: dict[str, Any]) -> tuple[str, str, str]:
+    title = "Native trace hot path unavailable"
+    description = f"CModule compilation failed ({p.get('reason')}); tracing falls back to a slower pure-JS callout."
+    return title, description, "low"
+
+
+def _describe_trace_started(p: dict[str, Any]) -> tuple[str, str, str]:
+    modules = p.get("modules") or []
+    scope = ", ".join(modules) if modules else "entire process (unscoped)"
+    engine = "native (CModule)" if p.get("native") else "JS fallback"
+    title = f"Trace started on thread {p.get('thread_id')}"
+    description = (
+        f"Scope: {scope}. Filter: {p.get('filter')}. Engine: {engine}. "
+        f"{p.get('excluded_module_count', 0)} other module(s) excluded from instrumentation."
+    )
+    return title, description, "medium"
+
+
+def _describe_trace_stopped(p: dict[str, Any]) -> tuple[str, str, str]:
+    dropped = p.get("dropped") or 0
+    dropped_note = f", {dropped} dropped to ring-buffer wraparound" if dropped else ""
+    title = f"Trace stopped on thread {p.get('thread_id')}"
+    description = f"Ran for {p.get('duration_ms')} ms, {p.get('total_hits')} instrumented hit(s) recorded{dropped_note}."
+    return title, description, "medium"
+
+
+def _describe_trace_summary(p: dict[str, Any]) -> tuple[str, str, str]:
+    top = p.get("top_addresses") or []
+    top_desc = "; ".join(f"{t.get('label')} x{t.get('count')}" for t in top[:5])
+    title = f"Trace summary for thread {p.get('thread_id')}"
+    description = (
+        f"{p.get('total_hits')} total hit(s), {p.get('sampled')} sampled. "
+        f"Top site(s): {top_desc or 'none'}."
+    )
+    return title, description, "info"
+
+
+# --------------------------------------------------------------------
 # framework_detection
 # --------------------------------------------------------------------
 
@@ -329,6 +385,12 @@ INTERPRETERS: dict[str, tuple[str, Describer]] = {
     "hook_installed": ("flutter_tls", _describe_hook_installed),
     "hook_installation_failed": ("flutter_tls", _describe_hook_installation_failed),
     "fallback_path_selected": ("flutter_tls", _describe_fallback_path_selected),
+    "stalker_engine_ready": ("native_tracing", _describe_stalker_engine_ready),
+    "cmodule_compiled": ("native_tracing", _describe_cmodule_compiled),
+    "cmodule_compile_failed": ("native_tracing", _describe_cmodule_compile_failed),
+    "trace_started": ("native_tracing", _describe_trace_started),
+    "trace_stopped": ("native_tracing", _describe_trace_stopped),
+    "trace_summary": ("native_tracing", _describe_trace_summary),
     "framework_detection_started": ("framework_detection", _describe_framework_detection_started),
     "framework_confidence": ("framework_detection", _describe_framework_confidence),
     "framework_evidence": ("framework_detection", _describe_framework_evidence),
