@@ -19,6 +19,7 @@ import * as tlsInspector from "./tls_inspector/tls_inspector.js";
 import * as antiDebug from "./anti_debug/anti_debug.js";
 import * as recon from "./recon/recon.js";
 import * as flutterTls from "./flutter_tls/flutter_tls.js";
+import * as stalkerTracer from "./stalker_tracer/stalker_tracer.js";
 import { selectModulesForDetectedFrameworks } from "./framework_detection/detector.js";
 
 const MODULE_NAME = "loader";
@@ -29,6 +30,7 @@ const MODULE_REGISTRY = {
     antidebug: antiDebug,
     recon,
     flutter_tls: flutterTls,
+    stalker_tracer: stalkerTracer,
 };
 
 /**
