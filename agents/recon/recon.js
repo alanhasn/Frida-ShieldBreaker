@@ -200,19 +200,31 @@ function enumerateSuspiciousClasses() {
     }
 }
 
+/**
+ * Hooks every overload of methodName, not just "the" implementation --
+ * confirmed live that a single-implementation assignment throws (and was
+ * silently swallowed as "not present") on a method with more than one
+ * overload, e.g. Activity.finish()/finish(int) on newer Android
+ * versions. Reaction points are exactly the kind of AOSP method likely
+ * to have grown an overload across API levels, so this can't assume one.
+ */
 function hookReactionPoint(className, methodName, label) {
     try {
         const Klass = Java.use(className);
-        Klass[methodName].implementation = function (...args) {
-            event(MODULE_NAME, "reaction_point_hit", {
-                label,
-                class: className,
-                method: methodName,
-                stack: currentStackTrace(),
-            });
-            return this[methodName](...args);
-        };
-        log(MODULE_NAME, "debug", `Hooked reaction point: ${label}`);
+        let hookedCount = 0;
+        Klass[methodName].overloads.forEach((overload) => {
+            overload.implementation = function (...args) {
+                event(MODULE_NAME, "reaction_point_hit", {
+                    label,
+                    class: className,
+                    method: methodName,
+                    stack: currentStackTrace(),
+                });
+                return this[methodName](...args);
+            };
+            hookedCount += 1;
+        });
+        log(MODULE_NAME, "debug", `Hooked reaction point: ${label} (${hookedCount} overload(s))`);
     } catch (e) {
         log(MODULE_NAME, "debug", `Reaction point not present: ${label} (${e.message})`);
     }
