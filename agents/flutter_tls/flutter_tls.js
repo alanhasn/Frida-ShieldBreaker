@@ -25,7 +25,7 @@
 // outside its intended scope.
 
 import { log, event } from "../common/rpc.js";
-import { isAndroid, findModules, readCString } from "../common/native_utils.js";
+import { isAndroid, isIOS, findModules, readCString } from "../common/native_utils.js";
 import { installNativeTlsHooksForModules } from "../tls_inspector/tls_inspector.js";
 
 const MODULE_NAME = "flutter_tls";
@@ -46,8 +46,14 @@ const FLUTTER_JAVA_MARKER_CLASSES = [
 // libflutter.so is the engine itself (Dart VM + BoringSSL); libapp.so is
 // the compiled Dart AOT snapshot for release/profile builds and may not
 // be present at all in JIT/debug builds. Flutter/App are the equivalent
-// iOS framework binary names as Frida reports them once loaded.
-const DEFAULT_ENGINE_MODULE_NAMES = ["libflutter.so", "libapp.so", "Flutter", "App"];
+// iOS framework binary names as Frida reports them once loaded -- "App"
+// is iOS-only, never checked on Android: confirmed live against a real
+// (non-Flutter) Android target that as a bare three-letter substring it
+// matches far too much unrelated system-library noise there
+// (app_process64, libappfuse.so, any module with "mapper" in its name)
+// to be a usable signal.
+const DEFAULT_ENGINE_MODULE_NAMES = ["libflutter.so", "libapp.so", "Flutter"];
+const IOS_ONLY_ENGINE_MODULE_NAMES = ["App"];
 
 /** Presence-only check for well-known Flutter embedding classes. Android-only; must run inside Java.perform. */
 function detectFlutterJavaMarkers() {
@@ -65,7 +71,8 @@ function detectFlutterJavaMarkers() {
 
 /** Locates Flutter's own native module(s), if any, honoring extra candidates supplied via config. */
 function discoverEngineModules(extraModuleNames) {
-    const candidates = [...DEFAULT_ENGINE_MODULE_NAMES, ...extraModuleNames];
+    const platformCandidates = isIOS() ? [...DEFAULT_ENGINE_MODULE_NAMES, ...IOS_ONLY_ENGINE_MODULE_NAMES] : DEFAULT_ENGINE_MODULE_NAMES;
+    const candidates = [...platformCandidates, ...extraModuleNames];
     return findModules(candidates);
 }
 

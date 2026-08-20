@@ -4,14 +4,19 @@
 // remains usable even when this detection subsystem hasn't run (e.g.
 // `--modules flutter_tls` without `--auto`).
 
-import { findModules, isAndroid } from "../common/native_utils.js";
+import { findModules, isAndroid, isIOS } from "../common/native_utils.js";
 import { scoreEvidence, javaClassPresent } from "./scoring.js";
 
 // Android: libflutter.so is the engine itself (Dart VM + BoringSSL);
 // libapp.so is the compiled Dart AOT snapshot and may be absent in
 // JIT/debug builds. iOS: Flutter/App are the equivalent framework binary
-// names as Frida reports them once loaded.
-const NATIVE_MODULE_CANDIDATES = ["libflutter.so", "libapp.so", "Flutter", "App"];
+// names as Frida reports them once loaded. "App" is checked on iOS only,
+// never on Android: confirmed live against a real (non-Flutter) Android
+// target that as a bare three-letter substring it matches far too much
+// unrelated system-library noise there (app_process64, libappfuse.so,
+// any module with "mapper" in its name) to be a usable signal.
+const NATIVE_MODULE_CANDIDATES = ["libflutter.so", "libapp.so", "Flutter"];
+const IOS_ONLY_NATIVE_MODULE_CANDIDATES = ["App"];
 
 // FlutterEngine is weighted to cross the detection threshold alone: it's
 // present as soon as the app's classloader is set up, which (on Android)
@@ -26,7 +31,10 @@ const JAVA_MARKERS = [
 ];
 
 export function detect() {
-    const nativeModules = findModules(NATIVE_MODULE_CANDIDATES);
+    const candidates = isIOS()
+        ? [...NATIVE_MODULE_CANDIDATES, ...IOS_ONLY_NATIVE_MODULE_CANDIDATES]
+        : NATIVE_MODULE_CANDIDATES;
+    const nativeModules = findModules(candidates);
 
     let dartRuntimeFound = false;
     for (const mod of nativeModules) {
