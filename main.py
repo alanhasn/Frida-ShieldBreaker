@@ -17,16 +17,18 @@ Example usage:
     python main.py run com.example.app --usb --spawn --auto --bypass
     python main.py run com.example.app --usb --spawn --auto --bypass \\
         --report reports/session --report-format json,html,docx
+    python main.py run com.example.app --usb --spawn --modules stalker_tracer --interactive
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import frida
 from rich.table import Table
@@ -125,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Comma-separated report formats to generate when --report is set "
              f"(default: all -- {', '.join(SUPPORTED_FORMATS)}).",
     )
+    run_parser.add_argument(
+        "-i", "--interactive", action="store_true",
+        help="Drop into an interactive shell instead of blocking silently until Ctrl+C. Lets you "
+             "drive stalker_tracer's RPC exports live (start/stop/inspect a native trace against a "
+             "running thread) -- type 'help' once connected. No effect on any other module.",
+    )
 
     return parser
 
@@ -142,6 +150,127 @@ def _loader_config_from_args(args: argparse.Namespace) -> LoaderConfig:
         use_usb=args.usb,
         remote_host=args.remote,
     )
+
+
+_INTERACTIVE_HELP = """\
+Commands:
+  stalker start --thread ID [--modules m1,m2] [--filter all|syscalls|calls] [--js]
+                              Start a native trace on OS thread ID.
+                              --modules scopes tracing (and excludes every other
+                              loaded module from instrumentation, the main lever
+                              against freezing the app); omit to trace everything
+                              (expensive). --filter defaults to all instructions;
+                              'syscalls' matches svc, 'calls' matches branch/call
+                              mnemonics. --js forces the slower pure-JS fallback
+                              instead of the native CModule hot path.
+  stalker stop [ID]          Stop tracing thread ID (or the only active session
+                              if exactly one is running).
+  stalker status              Show active trace sessions and CModule availability.
+  stalker drain ID [MAX]      Pull up to MAX (default 500) buffered hits from
+                              thread ID's session and report a frequency summary.
+  stalker threads              List OS thread ids Frida can see right now.
+  help                        Show this text.
+  quit / exit                 Detach and end the session (same as Ctrl+C).
+"""
+
+
+def _build_interactive_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="stalker", add_help=False, exit_on_error=False)
+    sub = parser.add_subparsers(dest="subcommand")
+
+    start = sub.add_parser("start", add_help=False, exit_on_error=False)
+    start.add_argument("--thread", type=int, required=True)
+    start.add_argument("--modules", type=str, default="")
+    start.add_argument("--filter", type=str, default="all")
+    start.add_argument("--js", action="store_true")
+
+    stop = sub.add_parser("stop", add_help=False, exit_on_error=False)
+    stop.add_argument("thread", type=int, nargs="?")
+
+    sub.add_parser("status", add_help=False, exit_on_error=False)
+    sub.add_parser("threads", add_help=False, exit_on_error=False)
+
+    drain = sub.add_parser("drain", add_help=False, exit_on_error=False)
+    drain.add_argument("thread", type=int)
+    drain.add_argument("max", type=int, nargs="?", default=500)
+
+    return parser
+
+
+def _dispatch_stalker_command(exports: Any, tokens: list[str]) -> None:
+    parser = _build_interactive_parser()
+    try:
+        args = parser.parse_args(tokens)
+    except argparse.ArgumentError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    except SystemExit:
+        # exit_on_error=False covers most argparse failure paths, but not
+        # every one (e.g. an invalid subcommand name in some Python
+        # versions) -- caught here too so a mistyped command never kills
+        # the whole interactive session.
+        console.print("[red]Invalid command -- type 'help'.[/red]")
+        return
+
+    if args.subcommand == "start":
+        modules = [m.strip() for m in args.modules.split(",") if m.strip()]
+        result = exports.stalker_start(
+            {"threadId": args.thread, "modules": modules, "filter": args.filter, "native": not args.js}
+        )
+        console.print(result)
+    elif args.subcommand == "stop":
+        thread_id = args.thread
+        if thread_id is None:
+            sessions = exports.stalker_status()["activeSessions"]
+            if len(sessions) != 1:
+                console.print("[yellow]Specify a thread id -- more or less than one session is active.[/yellow]")
+                return
+            thread_id = sessions[0]["threadId"]
+        console.print(exports.stalker_stop(thread_id))
+    elif args.subcommand == "status":
+        console.print(exports.stalker_status())
+    elif args.subcommand == "drain":
+        console.print(exports.stalker_drain(args.thread, args.max))
+    elif args.subcommand == "threads":
+        console.print(exports.stalker_list_threads())
+    else:
+        console.print("Unknown stalker command -- type 'help'.")
+
+
+def _run_interactive_shell(target: AttachedTarget) -> None:
+    """Minimal stdin REPL for calling agent RPC exports (currently: stalker_tracer) during a live session."""
+    exports = target.script.exports_sync
+    console.print("[bold]Interactive mode.[/bold] Type 'help' for commands, 'quit' to detach and exit.")
+    while True:
+        try:
+            line = input("shieldbreaker> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            break
+
+        if not line:
+            continue
+        if line in ("quit", "exit"):
+            break
+        if line == "help":
+            console.print(_INTERACTIVE_HELP)
+            continue
+
+        try:
+            tokens = shlex.split(line)
+        except ValueError as exc:
+            console.print(f"[red]Could not parse command: {exc}[/red]")
+            continue
+        if not tokens or tokens[0] != "stalker":
+            console.print("Unknown command -- type 'help'.")
+            continue
+
+        try:
+            _dispatch_stalker_command(exports, tokens[1:])
+        except frida.core.RPCException as exc:
+            logger.error("RPC call failed: %s", exc)
+        except Exception:
+            logger.exception("Interactive command failed")
 
 
 def cmd_devices(_: argparse.Namespace) -> int:
@@ -250,7 +379,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         if args.spawn and not args.no_resume:
             loader.resume(target)
 
-        loader.wait_forever()
+        if args.interactive:
+            _run_interactive_shell(target)
+        else:
+            loader.wait_forever()
         loader.detach(target, kill=args.kill_on_exit and target.spawned_by_us)
 
     if args.report and report_collector is not None and session_meta is not None:
